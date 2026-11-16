@@ -591,7 +591,7 @@ def analyze_options_footprint(
         sql_inv = """
         SELECT category, foreign_net 
         FROM eod_investor_types 
-        WHERE trade_date = ? AND category IN ('Equity Index Call Options', 'Equity Index Put Options');
+        WHERE trade_date = ? AND (category LIKE '%Option%' OR category LIKE '%Call%' OR category LIKE '%Put%');
         """
         _, rows_inv = execute_turso_sql(pipeline_url, auth_token, sql_inv, [t_0])
         f_call_net = 0
@@ -600,18 +600,18 @@ def analyze_options_footprint(
             cat = str(r[0])
             val = int(r[1] or 0)
             if "Call" in cat:
-                f_call_net = val
+                f_call_net += val
             elif "Put" in cat:
-                f_put_net = val
+                f_put_net += val
 
         # 2. Fetch Options Series at T_0 and T_-1 for front_series
         sql_opts = """
         SELECT option_type, strike, settlement_price, oi, volume 
         FROM eod_options_series 
-        WHERE trade_date = ? AND series = ?;
+        WHERE trade_date = ? AND (series = ? OR symbol LIKE ?);
         """
-        _, rows_o0 = execute_turso_sql(pipeline_url, auth_token, sql_opts, [t_0, front_series])
-        _, rows_oprev = execute_turso_sql(pipeline_url, auth_token, sql_opts, [t_minus_1, front_series])
+        _, rows_o0 = execute_turso_sql(pipeline_url, auth_token, sql_opts, [t_0, front_series, f"{front_series}%"])
+        _, rows_oprev = execute_turso_sql(pipeline_url, auth_token, sql_opts, [t_minus_1, front_series, f"{front_series}%"])
 
         prev_map = {}
         for r in rows_oprev:
@@ -657,55 +657,54 @@ def analyze_options_footprint(
             elif otype == "P":
                 put_candidates.append(item)
 
-        # Top Call Strike
+        # Top Call Strike with positive delta OI
         calls_pos = [c for c in call_candidates if c["doi"] > 0]
         if calls_pos:
             top_call = max(calls_pos, key=lambda x: x["doi"])
-        elif call_candidates:
-            top_call = max(call_candidates, key=lambda x: x["oi_0"])
-        else:
-            top_call = {"strike": futures_ref_t0, "doi": 0, "div": 0.0}
-
-        # Top Put Strike
-        puts_pos = [p for p in put_candidates if p["doi"] > 0]
-        if puts_pos:
-            top_put = max(puts_pos, key=lambda x: x["doi"])
-        elif put_candidates:
-            top_put = max(put_candidates, key=lambda x: x["oi_0"])
-        else:
-            top_put = {"strike": futures_ref_t0, "doi": 0, "div": 0.0}
-
-        # Institutional Intent Interpretation
-        if top_call["doi"] > 0:
-            if top_call["div"] > 0.5:
-                call_intent = "Aggressive Call Buying (เก็งกำไรขาขึ้นทะลุต้าน)"
-            elif top_call["div"] <= 0.0:
+            top_call_strike = float(top_call["strike"])
+            top_call_doi = int(top_call["doi"])
+            top_call_div = float(top_call["div"])
+            if top_call_div > 0.5:
+                call_intent = "Aggressive Call Buying (เก็งกำไรทะลุต้าน)"
+            elif top_call_div <= 0.0:
                 call_intent = "Call Writing / Cap Resistance (ล็อกแนวต้าน / เก็บพรีเมียม)"
             else:
                 call_intent = "Call Accumulation (สะสมสัญญา Call)"
         else:
-            call_intent = "Call Liquidation / Neutral (ปิดสัญญา / ทรงตัว)"
+            top_call_strike = None
+            top_call_doi = 0
+            top_call_div = 0.0
+            call_intent = "ไม่มีการเปลี่ยนแปลง OI ที่มีนัยสำคัญ"
 
-        if top_put["doi"] > 0:
-            if top_put["div"] > 0.5:
-                put_intent = "Aggressive Put Buying / Downside Hedging (ประกันความเสี่ยงขาลงอย่างเร่งด่วน)"
-            elif top_put["div"] <= 0.0:
+        # Top Put Strike with positive delta OI
+        puts_pos = [p for p in put_candidates if p["doi"] > 0]
+        if puts_pos:
+            top_put = max(puts_pos, key=lambda x: x["doi"])
+            top_put_strike = float(top_put["strike"])
+            top_put_doi = int(top_put["doi"])
+            top_put_div = float(top_put["div"])
+            if top_put_div > 0.5:
+                put_intent = "Aggressive Put Buying / Downside Hedging (ประกันความเสี่ยงขาลงเร่งด่วน)"
+            elif top_put_div <= 0.0:
                 put_intent = "Put Writing / Floor Support (ขาย Put ล็อกฐานแนวรับ)"
             else:
                 put_intent = "Put Accumulation (สะสมสัญญา Put)"
         else:
-            put_intent = "Put Liquidation / Neutral (ปิดสัญญา / ทรงตัว)"
+            top_put_strike = None
+            top_put_doi = 0
+            top_put_div = 0.0
+            put_intent = "ไม่มีการเปลี่ยนแปลง OI ที่มีนัยสำคัญ"
 
         return {
             "foreign_call_net": f_call_net,
             "foreign_put_net": f_put_net,
-            "top_call_strike": float(top_call["strike"]),
-            "top_call_doi": int(top_call["doi"]),
-            "top_call_div": float(top_call["div"]),
+            "top_call_strike": top_call_strike,
+            "top_call_doi": top_call_doi,
+            "top_call_div": top_call_div,
             "call_intent": call_intent,
-            "top_put_strike": float(top_put["strike"]),
-            "top_put_doi": int(top_put["doi"]),
-            "top_put_div": float(top_put["div"]),
+            "top_put_strike": top_put_strike,
+            "top_put_doi": top_put_doi,
+            "top_put_div": top_put_div,
             "put_intent": put_intent
         }
     except Exception as e:
@@ -713,14 +712,14 @@ def analyze_options_footprint(
         return {
             "foreign_call_net": 0,
             "foreign_put_net": 0,
-            "top_call_strike": futures_ref_t0,
+            "top_call_strike": None,
             "top_call_doi": 0,
             "top_call_div": 0.0,
-            "call_intent": "N/A",
-            "top_put_strike": futures_ref_t0,
+            "call_intent": "ไม่มีการเปลี่ยนแปลง OI ที่มีนัยสำคัญ",
+            "top_put_strike": None,
             "top_put_doi": 0,
             "top_put_div": 0.0,
-            "put_intent": "N/A"
+            "put_intent": "ไม่มีการเปลี่ยนแปลง OI ที่มีนัยสำคัญ"
         }
 
 # ==============================================================================
@@ -1127,7 +1126,7 @@ def generate_thai_trading_playbook(
     # 2. Smart Money Translation & Actionable Playbook Logic
     if foreign_net > 0 and delta_oi > 0:
         flow_title = "New Long Build-up (ต่างชาติเปิดสะสม Long ใหม่)"
-        flow_detail = f"ต่างชาติซื้อสุทธิ <code>{foreign_net:+,}</code> สัญญา พร้อม OI ขยาย <code>{delta_oi:+,}</code> เป็นการเปิด Long หนุนตลาดขึ้นแท้จริง"
+        flow_detail = f"ต่างชาติซื้อสุทธิ <code>{foreign_net:+,}</code> พร้อม OI ขยาย <code>{delta_oi:+,}</code> สัญญา เป็นการเปิด Long ใหม่หนุนตลาดขึ้น"
         flow_caution = f"หากผ่านต้าน 1 (<code>{res_1:.0f}</code>) ได้ โมเมนตัมจะพาไปทดสอบ Upper 1-SD หรือต้าน 2 (<code>{res_2:.0f}</code>)"
         action_strategy = "Follow-Through ฝั่ง Long ตามโมเมนตัม ไม่ดักสวนเทรนด์"
         long_plan = f"รอจังหวะย่อตัวแถว รับ 1 (<code>{sup_1:.0f}</code>) หรือราคาเปิด ยืนได้เปิด Long เป้าหมาย <code>{res_1:.0f}</code> และ <code>{upper_1sd:.1f}</code>"
@@ -1135,7 +1134,7 @@ def generate_thai_trading_playbook(
         stop_loss_plan = f"ฝั่ง Long วาง Stop Loss เมื่อราคาหลุด <code>{min(sup_2, f_cost):.0f}</code> จุด (แนว Defense ฝรั่ง)"
     elif foreign_net > 0 and delta_oi < 0:
         flow_title = "Short Covering (ต่างชาติปิดทำกำไร Short)"
-        flow_detail = f"ต่างชาติซื้อสุทธิ <code>{foreign_net:+,}</code> สัญญา แต่ OI หดตัว <code>{delta_oi:+,}</code> สัญญา เป็นแรงซื้อคืนปิดสัญญา Short เดิม"
+        flow_detail = f"ต่างชาติซื้อสุทธิ <code>{foreign_net:+,}</code> แต่ OI ลด <code>{delta_oi:+,}</code> สัญญา เป็นแรงซื้อคืนปิด Short เดิม"
         flow_caution = f"การดีดตัวอาจเป็นเพียง Technical Rebound ระยะสั้น ระวังแรงขายทำกำไรบริเวณแนวต้าน ต้าน 1 หรือ Max Pain (<code>{max_pain:.0f}</code>)"
         action_strategy = "เน้นเล่นรอบในกรอบ (Range-Bound / Mean Reversion) ดักย่อซื้อ-เด้งขาย ไม่ไล่ราคา"
         long_plan = f"รอตั้งรับบริเวณ Lower 1-SD (<code>{lower_1sd:.1f}</code>) หรือ รับ 1 (<code>{sup_1:.0f}</code>) เป้าทำกำไรที่ Max Pain (<code>{max_pain:.0f}</code>) หรือ ต้าน 1"
@@ -1143,7 +1142,7 @@ def generate_thai_trading_playbook(
         stop_loss_plan = f"ฝั่ง Long คัตเมื่อหลุด <code>{sup_2:.0f}</code> | ฝั่ง Short คัตเมื่อทะลุเหนือ <code>{res_1 + 3.0:.1f}</code>"
     elif foreign_net < 0 and delta_oi > 0:
         flow_title = "New Short Build-up (ต่างชาติเปิดสะสม Short ใหม่)"
-        flow_detail = f"ต่างชาติขายสุทธิ <code>{foreign_net:+,}</code> สัญญา และ OI ขยาย <code>{delta_oi:+,}</code> สัญญา สะท้อนการเปิด Short เพิ่มเพื่อเก็งกำไรขาลง"
+        flow_detail = f"ต่างชาติขายสุทธิ <code>{foreign_net:+,}</code> และ OI ขยาย <code>{delta_oi:+,}</code> สัญญา สะท้อนการเปิด Short เพิ่มเก็งขาลง"
         flow_caution = f"แรงกดดันฝั่งขายสูง หากหลุด รับ 1 (<code>{sup_1:.0f}</code>) ดีลเลอร์จะเร่งขายตาม เสี่ยงไหลลงทดสอบ Lower 1-SD"
         action_strategy = "เน้นฝั่ง Short (Trend Expansion Down) ตามน้ำ ระวังการหลุดแนวรับแล้วรูดแรง"
         long_plan = f"หลีกเลี่ยงการดักสวนรับเร็ว จนกว่าราคาจะแตะ รับ 2 (<code>{sup_2:.0f}</code>) หรือ Lower 1-SD แล้วเกิดสัญญาณหยุดลง"
@@ -1151,7 +1150,7 @@ def generate_thai_trading_playbook(
         stop_loss_plan = f"ฝั่ง Short วาง Stop Loss เหนือ <code>{max(res_1 + 2.5, f_cost):.1f}</code> จุด"
     elif foreign_net < 0 and delta_oi < 0:
         flow_title = "Long Liquidation (ต่างชาติปิดลดพอร์ต Long)"
-        flow_detail = f"ต่างชาติขายสุทธิ <code>{foreign_net:+,}</code> สัญญา ควบคู่กับ OI ลดลง <code>{delta_oi:+,}</code> สัญญา เป็นการปิดสัญญาลดความเสี่ยง"
+        flow_detail = f"ต่างชาติขายสุทธิ <code>{foreign_net:+,}</code> ควบคู่กับ OI ลดลง <code>{delta_oi:+,}</code> สัญญา เป็นการปิดสัญญาลดความเสี่ยง"
         flow_caution = f"ตลาดขาดแรงซื้อหนุน ตราบใดที่ยังไม่ยืนเหนือต้าน 1 (<code>{res_1:.0f}</code>) ให้ระวังการซึมลง"
         action_strategy = "เทรดรอบสั้นอย่างระมัดระวัง เน้นตั้งรับต่ำและไม่ไล่ราคา"
         long_plan = f"ดักซื้อบริเวณ รับ 1 (<code>{sup_1:.0f}</code>) หรือ Lower 1-SD (<code>{lower_1sd:.1f}</code>) เพื่อเล่นรีบาวด์สั้นๆ"
@@ -1216,28 +1215,53 @@ def generate_thai_trading_playbook(
     if options_footprint:
         o_c_net = options_footprint.get("foreign_call_net", 0)
         o_p_net = options_footprint.get("foreign_put_net", 0)
-        top_c_k = options_footprint.get("top_call_strike", res_1)
+        top_c_k = options_footprint.get("top_call_strike")
         top_c_doi = options_footprint.get("top_call_doi", 0)
         top_c_div = options_footprint.get("top_call_div", 0.0)
-        c_intent = options_footprint.get("call_intent", "N/A")
-        top_p_k = options_footprint.get("top_put_strike", sup_1)
+        c_intent = options_footprint.get("call_intent", "ไม่มีการเปลี่ยนแปลง OI ที่มีนัยสำคัญ")
+
+        top_p_k = options_footprint.get("top_put_strike")
         top_p_doi = options_footprint.get("top_put_doi", 0)
         top_p_div = options_footprint.get("top_put_div", 0.0)
-        p_intent = options_footprint.get("put_intent", "N/A")
+        p_intent = options_footprint.get("put_intent", "ไม่มีการเปลี่ยนแปลง OI ที่มีนัยสำคัญ")
+
+        if top_c_k is not None and top_c_doi > 0:
+            call_line = f"Call เด่น: Strike <code>{top_c_k:.0f}</code> (ΔOI: <code>{top_c_doi:+,}</code>, ΔIV: <code>{top_c_div:+.2f}%</code>) ➔ <i>{c_intent}</i>"
+        else:
+            call_line = f"Call เด่น: <i>{c_intent}</i>"
+
+        if top_p_k is not None and top_p_doi > 0:
+            put_line = f"Put เด่น: Strike <code>{top_p_k:.0f}</code> (ΔOI: <code>{top_p_doi:+,}</code>, ΔIV: <code>{top_p_div:+.2f}%</code>) ➔ <i>{p_intent}</i>"
+        else:
+            put_line = f"Put เด่น: <i>{p_intent}</i>"
 
         options_footprint_block = f"""• <b>Options Strike Footprint:</b>
   - ต่างชาติ Options: Call <code>{o_c_net:+,}</code> | Put <code>{o_p_net:+,}</code> สัญญา
-  - Call เด่น: Strike <code>{top_c_k:.0f}</code> (ΔOI: <code>{top_c_doi:+,}</code>, ΔIV: <code>{top_c_div:+.2f}%</code>) ➔ <i>{c_intent}</i>
-  - Put เด่น: Strike <code>{top_p_k:.0f}</code> (ΔOI: <code>{top_p_doi:+,}</code>, ΔIV: <code>{top_p_div:+.2f}%</code>) ➔ <i>{p_intent}</i>"""
+  - {call_line}
+  - {put_line}"""
     else:
         options_footprint_block = ""
 
     # Format Institutional Cost Narrative for Action Plan
     if foreign_footprint and f_cost > 0:
-        if futures_ref >= f_cost:
-            cost_relation = f"ราคายืนเหนือต้นทุนเฉลี่ยฝรั่ง ({f_cost:.1f}) ทำหน้าที่เป็นแนวรับจิตวิทยา (Defense Line)"
+        cum_f = foreign_footprint.get("cum_foreign_net", 0)
+        if cum_f < 0:
+            if futures_ref < f_cost:
+                pnl = f_cost - futures_ref
+                cost_relation = f"ต่างชาติกำลังกำไรฝั่ง Short (+{pnl:.1f} จุด) แนว {f_cost:.1f} คือแนวต้านต้นทุน หากดีดไม่ผ่านระวังแรงกด Short ซ้ำ แต่หากทะลุยืนเหนือได้จะเกิดแรงซื้อคืน (Short Squeeze)"
+            else:
+                loss = futures_ref - f_cost
+                cost_relation = f"ต่างชาติติดลบฝั่ง Short (-{loss:.1f} จุด) ราคาอยู่เหนือแนวต้านต้นทุน ({f_cost:.1f}) ระวังเกิด Short Squeeze เร่งแรงดีดตัว"
+        elif cum_f > 0:
+            if futures_ref >= f_cost:
+                pnl = futures_ref - f_cost
+                cost_relation = f"ต่างชาติกำไรฝั่ง Long (+{pnl:.1f} จุด) พร้อมรันเทรนด์ โดยระดับ {f_cost:.1f} ทำหน้าที่เป็นแนวรับจิตวิทยา (Defense Line)"
+            else:
+                loss = f_cost - futures_ref
+                cost_relation = f"ราคาอยู่ใต้ต้นทุนเฉลี่ยฝรั่ง ({f_cost:.1f}) ต่างชาติขาดทุนฝั่ง Long (-{loss:.1f} จุด) ระวังแรงขายตัดขาดทุนหรือแรงขายลดเสี่ยงเมื่อชนต้นทุน"
         else:
-            cost_relation = f"ราคาต่ำกว่าต้นทุนเฉลี่ยฝรั่ง ({f_cost:.1f}) ต่างชาติติดดอย ระวังแรงขายลดเสี่ยงเมื่อชน {f_cost:.1f}"
+            cost_relation = f"ต้นทุนเฉลี่ยฝรั่งอยู่ที่ {f_cost:.1f} จุด (สถานะสะสมใกล้เคียงศูนย์/เท่าทุน)"
+
         cost_narrative = f"""• <b>แนวปะทะต้นทุนสถาบัน (Institutional Cost Line):</b> <code>{f_cost:.1f}</code> จุด
   <i>({cost_relation})</i>
 """
@@ -1245,9 +1269,29 @@ def generate_thai_trading_playbook(
         cost_narrative = ""
 
     if is_positive_gamma:
-        gamma_desc_compact = f"ราคาเหนือ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Long Gamma ซับแรงเหวี่ยง มักแกว่งในกรอบ"
+        gamma_desc_compact = f"ราคาเหนือ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Long Gamma ซับแรงเหวี่ยง ช่วยพยุงการแกว่งตัวในกรอบ (Mean Reversion)"
     else:
-        gamma_desc_compact = f"ราคาใต้ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Short Gamma หลุดรับจะเร่งแรงขาย ผันผวนสูง"
+        gamma_desc_compact = f"ราคาใต้ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Short Gamma หลุดรับจะเร่งแรงขาย ระวังความผันผวนขยายตัว (Trend Expansion)"
+
+    # Assemble Sections 3 and 4 cleanly
+    sec4_lines = [
+        "🌊 <b>4. พฤติกรรมรายใหญ่ (Smart Money Flow & Footprint)</b>",
+        f"• <b>สถานะ Flow:</b> {flow_emoji} <b>{flow_title}</b>",
+        f"  <i>({flow_detail})</i>",
+        f"• <b>ยอดซื้อขายรายกลุ่ม:</b> ต่างชาติ <code>{foreign_net:+,}</code> (ΔOI: <code>{delta_oi:+,}</code>) | กองทุน <code>{inst_net:+,}</code> | รายย่อย <code>{local_net:+,}</code>"
+    ]
+    if foreign_footprint_block:
+        sec4_lines.append(foreign_footprint_block)
+    if options_footprint_block:
+        sec4_lines.append(options_footprint_block)
+    sec4_text = "\n".join(sec4_lines)
+
+    body_blocks = []
+    if intraday_block:
+        body_blocks.append(intraday_block.strip())
+    if sec4_text:
+        body_blocks.append(sec4_text.strip())
+    body_content = "\n\n".join(body_blocks)
 
     msg = f"""🎯 <b>แผนการเทรด SET50 ประจำวัน | TFEX QUANT RADAR</b>
 📅 <i>ข้อมูลสิ้นวัน {trade_date} | ออกรายงานเช้า {as_of_time_bkk} น.</i>
@@ -1263,13 +1307,7 @@ def generate_thai_trading_playbook(
 ───────────────
 🏛️ <i>กรอบใหญ่ไตรมาส: Put Wall <code>{put_wall:.0f}</code> – Call Wall <code>{call_wall:.0f}</code> | Gamma Flip: <code>{gamma_flip_str}</code></i>
 
-{intraday_block}
-🌊 <b>4. พฤติกรรมรายใหญ่ (Smart Money Flow & Footprint)</b>
-• <b>สถานะ Flow:</b> {flow_emoji} <b>{flow_title}</b>
-  <i>({flow_detail})</i>
-• <b>ยอดซื้อขายรายกลุ่ม:</b> ต่างชาติ <code>{foreign_net:+,}</code> (ΔOI: <code>{delta_oi:+,}</code>) | กองทุน <code>{inst_net:+,}</code> | รายย่อย <code>{local_net:+,}</code>
-{foreign_footprint_block}
-{options_footprint_block}
+{body_content}
 
 ⚔️ <b>5. กลยุทธ์และแผนการเล่นวันนี้ (Daily Action Plan)</b>
 • <b>สภาวะตลาด (Dealer Gamma):</b> {gamma_emoji} <b>{gamma_zone_title}</b>
@@ -1881,56 +1919,53 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         pain_payouts.append((s_eval, total_payout))
     max_pain = float(min(pain_payouts, key=lambda x: x[1])[0])
 
-    # Gamma Flip (Zero Crossing of Cumulative GEX)
-    gamma_flip_cum = np.nan
-    for i in range(len(res_df) - 1):
-        c1 = res_df.iloc[i]["cum_gex"]
-        c2 = res_df.iloc[i + 1]["cum_gex"]
-        k1 = res_df.iloc[i]["strike"]
-        k2 = res_df.iloc[i + 1]["strike"]
+    # Gamma Flip (Zero Crossing in Active Zone Spot ± 75 pts to avoid far-strike distortions)
+    active_gex_df = res_df[(res_df["strike"] >= futures_ref - 75.0) & (res_df["strike"] <= futures_ref + 75.0)].copy()
+    if len(active_gex_df) < 3:
+        active_gex_df = res_df.copy()
+
+    flip_candidates = []
+    # 1. Search zero crossings for cum_gex within active strikes
+    for i in range(len(active_gex_df) - 1):
+        c1 = active_gex_df.iloc[i]["cum_gex"]
+        c2 = active_gex_df.iloc[i + 1]["cum_gex"]
+        k1 = active_gex_df.iloc[i]["strike"]
+        k2 = active_gex_df.iloc[i + 1]["strike"]
         if (c1 <= 0 and c2 >= 0) or (c1 >= 0 and c2 <= 0):
             if c2 != c1:
-                gamma_flip_cum = float(k1 + (0 - c1) * (k2 - k1) / (c2 - c1))
+                flip_candidates.append(float(k1 + (0 - c1) * (k2 - k1) / (c2 - c1)))
             else:
-                gamma_flip_cum = float(k1)
-            break
+                flip_candidates.append(float(k1))
 
-    # Net GEX Zero Crossing
-    net_flip = np.nan
-    for i in range(len(res_df) - 1):
-        g1 = res_df.iloc[i]["net_gex_mb"]
-        g2 = res_df.iloc[i + 1]["net_gex_mb"]
-        k1 = res_df.iloc[i]["strike"]
-        k2 = res_df.iloc[i + 1]["strike"]
+    # 2. Search zero crossings for net_gex_mb within active strikes
+    for i in range(len(active_gex_df) - 1):
+        g1 = active_gex_df.iloc[i]["net_gex_mb"]
+        g2 = active_gex_df.iloc[i + 1]["net_gex_mb"]
+        k1 = active_gex_df.iloc[i]["strike"]
+        k2 = active_gex_df.iloc[i + 1]["strike"]
         if (g1 <= 0 and g2 >= 0) or (g1 >= 0 and g2 <= 0):
             if g2 != g1:
-                net_flip = float(k1 + (0 - g1) * (k2 - k1) / (g2 - g1))
+                flip_candidates.append(float(k1 + (0 - g1) * (k2 - k1) / (g2 - g1)))
             else:
-                net_flip = float(k1)
-            break
+                flip_candidates.append(float(k1))
+
+    if flip_candidates:
+        # Pick zero-crossing closest to futures_ref
+        gamma_flip_val = float(min(flip_candidates, key=lambda x: abs(x - futures_ref)))
+    else:
+        # Fallback to max_pain if no zero-crossing in active range
+        gamma_flip_val = float(max_pain)
 
     total_net_gex = float(res_df["net_gex_mb"].sum())
-    gamma_flip_val = gamma_flip_cum if not math.isnan(gamma_flip_cum) else net_flip
 
     # Consistent Gamma Regime: Aligned with current price position relative to Gamma Flip
-    if not math.isnan(gamma_flip_val):
-        if futures_ref >= gamma_flip_val:
-            is_positive_gamma = True
-            gamma_zone_title = "Positive Gamma (โซนลดความผันผวน / Mean Reversion)"
-            gamma_desc = f"ราคาปัจจุบัน ({futures_ref:.1f}) อยู่เหนือ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์อยู่ในสถานะ Long Gamma (ซื้อแนวรับ-ขายแนวต้าน) ช่วยซับแรงเหวี่ยง ทำให้ตลาดมักแกว่งตัวในกรอบ"
-        else:
-            is_positive_gamma = False
-            gamma_zone_title = "Negative Gamma (โซนเร่งความผันผวน / Trend Expansion)"
-            gamma_desc = f"ราคาปัจจุบัน ({futures_ref:.1f}) อยู่ใต้ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์อยู่ในสถานะ Short Gamma (ต้องเปิด Hedging ตามแนวโน้ม) หากหลุดแนวรับจะเร่งแรงขายซ้ำเติม ทำให้เกิดความผันผวนสูง"
+    is_positive_gamma = (futures_ref >= gamma_flip_val)
+    if is_positive_gamma:
+        gamma_zone_title = "Positive Gamma (โซนลดความผันผวน / Mean Reversion)"
+        gamma_desc = f"ราคาปัจจุบัน ({futures_ref:.1f}) อยู่เหนือ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์อยู่ในสถานะ Long Gamma (ซื้อแนวรับ-ขายแนวต้าน) ช่วยซับแรงเหวี่ยง ทำให้ตลาดมักแกว่งตัวในกรอบ"
     else:
-        if total_net_gex >= 0:
-            is_positive_gamma = True
-            gamma_zone_title = "Positive Gamma (โซนลดความผันผวน)"
-            gamma_desc = "Net GEX รวมเป็นบวก ดีลเลอร์ช่วยซับแรงกระแทก ตลาดมีแนวโน้มแกว่งตัวในกรอบ"
-        else:
-            is_positive_gamma = False
-            gamma_zone_title = "Negative Gamma (โซนเร่งความผันผวน)"
-            gamma_desc = "Net GEX รวมเป็นลบ ดีลเลอร์เร่งโมเมนตัมตามแนวโน้ม ระวังความผันผวนขยายตัว"
+        gamma_zone_title = "Negative Gamma (โซนเร่งความผันผวน / Trend Expansion)"
+        gamma_desc = f"ราคาปัจจุบัน ({futures_ref:.1f}) อยู่ใต้ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์อยู่ในสถานะ Short Gamma (ต้องเปิด Hedging ตามแนวโน้ม) หากหลุดแนวรับจะเร่งแรงขายซ้ำเติม ทำให้เกิดความผันผวนสูง"
 
     gamma_regime = "Positive Gamma" if is_positive_gamma else "Negative Gamma"
 
