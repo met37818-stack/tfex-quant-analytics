@@ -133,7 +133,7 @@ def execute_turso_sql(pipeline_url: str, auth_token: str, sql: str, args: list =
     return cols, rows
 
 def init_analytics_tables(pipeline_url: str, auth_token: str):
-    """Ensure analytics_premarket_log table exists."""
+    """Ensure analytics_premarket_log and daily_realized_vol tables exist."""
     ddl = """
     CREATE TABLE IF NOT EXISTS analytics_premarket_log (
         trade_date TEXT PRIMARY KEY,
@@ -148,6 +148,16 @@ def init_analytics_tables(pipeline_url: str, auth_token: str):
     );
     """
     execute_turso_sql(pipeline_url, auth_token, ddl)
+
+    ddl_rv = """
+    CREATE TABLE IF NOT EXISTS daily_realized_vol (
+        trade_date TEXT PRIMARY KEY,
+        rv_annualized REAL,
+        bar_count INTEGER,
+        updated_at_bkk TEXT
+    );
+    """
+    execute_turso_sql(pipeline_url, auth_token, ddl_rv)
 
 # ==============================================================================
 # CALENDAR & EXPIRY UTILITIES
@@ -511,10 +521,10 @@ def analyze_foreign_footprint(
 
         is_outlier = abs(z_score) >= 1.5
         if is_outlier:
-            tag = "ซื้อหนักผิดปกติ" if z_score > 0 else "ขายหนักผิดปกติ"
-            z_desc = f"🚨 ผิดปกติอย่างมีนัยสำคัญ ({tag} Outlier: Z = {z_score:+.2f} SD)"
+            tag = "ซื้อหนัก" if z_score > 0 else "ขายหนัก"
+            z_desc = f"🚨 Outlier {tag} (Z = {z_score:+.2f} SD)"
         else:
-            z_desc = f"ปกติ (Z = {z_score:+.2f} SD เกาะกลุ่มค่าเฉลี่ย 20 วัน)"
+            z_desc = f"ปกติ (Z = {z_score:+.2f} SD)"
 
         # 5-day Price-Flow Divergence
         n_div = min(5, len(records))
@@ -525,15 +535,15 @@ def analyze_foreign_footprint(
             flow_sum_5d = sum(r["foreign_net"] for r in records[-n_div:])
 
             if price_diff >= 3.0 and flow_sum_5d <= -5000:
-                divergence_text = f"⚠️ Bearish Divergence (ราคาขึ้น {price_diff:+.1f} แต่ต่างชาติเทขาย {flow_sum_5d:+,} สัญญา)"
+                divergence_text = f"⚠️ Bearish (ราคาขึ้น {price_diff:+.1f} แต่ฝรั่งขาย {flow_sum_5d:+,})"
             elif price_diff <= -3.0 and flow_sum_5d >= 5000:
-                divergence_text = f"💡 Bullish Divergence (ราคาย่อตัว {price_diff:+.1f} แต่ต่างชาติทยอยช้อนซื้อ {flow_sum_5d:+,} สัญญา)"
+                divergence_text = f"💡 Bullish (ราคาย่อ {price_diff:+.1f} แต่ฝรั่งซื้อ {flow_sum_5d:+,})"
             elif (price_diff >= 0 and flow_sum_5d >= 0) or (price_diff <= 0 and flow_sum_5d <= 0):
-                divergence_text = "สอดคล้องกับทิศทางราคา (Confluent Direction)"
+                divergence_text = "สอดคล้องกับราคา (Confluent)"
             else:
-                divergence_text = "ไม่มีสัญญาณ Divergence เด่นชัด (Sideway / Neutral)"
+                divergence_text = "ไม่มี Divergence เด่นชัด (Neutral)"
         else:
-            divergence_text = "ข้อมูลไม่เพียงพอสำหรับการวิเคราะห์ Divergence"
+            divergence_text = "ข้อมูลไม่พอวิเคราะห์ Divergence"
 
         return {
             "cum_foreign_net": int(cum_net),
@@ -714,6 +724,345 @@ def analyze_options_footprint(
         }
 
 # ==============================================================================
+# INTRADAY WARM-UP ANALYTICS (REALIZED VOLATILITY, VOLUME PROFILE, LATE SESSION)
+# ==============================================================================
+
+def compute_intraday_rv(
+    pipeline_url: str,
+    auth_token: str,
+    trade_date: str,
+    front_series: str,
+    atm_iv: float
+) -> dict:
+    """
+    Fetches 1-minute candlestick data from Turso (futures_snapshots / spot_snapshots),
+    computes log returns to determine Annualized Realized Volatility (RV),
+    persists/upserts into daily_realized_vol table, and compares RV vs ATM IV.
+    """
+    now_bkk = datetime.datetime.now(BKK_TZ)
+    updated_at_bkk = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        # 1. Fetch 1-minute futures bars for the given trade_date
+        sql_fut = """
+        SELECT captured_at_bkk, last 
+        FROM futures_snapshots 
+        WHERE symbol = ? AND captured_at_bkk LIKE ? AND last IS NOT NULL AND last > 0 
+        ORDER BY captured_at_bkk ASC;
+        """
+        _, rows_fut = execute_turso_sql(pipeline_url, auth_token, sql_fut, [front_series, f"{trade_date}%"])
+        prices = [float(r[1]) for r in rows_fut if r[1] is not None]
+
+        # Fallback to spot_snapshots if futures bars are insufficient
+        if len(prices) < 10:
+            sql_spot = """
+            SELECT captured_at_bkk, last 
+            FROM spot_snapshots 
+            WHERE symbol = 'SET50' AND captured_at_bkk LIKE ? AND last IS NOT NULL AND last > 0 
+            ORDER BY captured_at_bkk ASC;
+            """
+            _, rows_spot = execute_turso_sql(pipeline_url, auth_token, sql_spot, [f"{trade_date}%"])
+            if rows_spot:
+                prices = [float(r[1]) for r in rows_spot if r[1] is not None]
+
+        bar_count = len(prices)
+        if bar_count >= 5:
+            log_returns = [
+                math.log(prices[i] / prices[i - 1]) 
+                for i in range(1, bar_count) 
+                if prices[i] > 0 and prices[i - 1] > 0
+            ]
+            sum_sq = sum(r * r for r in log_returns)
+            rv_annualized = math.sqrt(252.0 * sum_sq)
+        else:
+            rv_annualized = atm_iv
+            bar_count = max(bar_count, 0)
+
+        # 2. Persist / UPSERT to daily_realized_vol
+        upsert_sql = """
+        INSERT OR REPLACE INTO daily_realized_vol (trade_date, rv_annualized, bar_count, updated_at_bkk)
+        VALUES (?, ?, ?, ?);
+        """
+        execute_turso_sql(pipeline_url, auth_token, upsert_sql, [trade_date, rv_annualized, bar_count, updated_at_bkk])
+
+        # 3. Compare RV vs ATM IV
+        spread = (atm_iv - rv_annualized) * 100.0
+        if bar_count < 10:
+            vol_regime_desc = "ข้อมูล Intraday กำลังสะสม (ใช้ค่า ATM IV อ้างอิง)"
+        elif atm_iv > rv_annualized + 0.02:
+            vol_regime_desc = f"IV Premium สูง (Options แพงกว่าแกว่งจริง +{spread:.1f}% เหมาะเทรดในกรอบ)"
+        elif rv_annualized >= atm_iv:
+            vol_regime_desc = f"RV ทะลุ IV (ตลาดแกว่งจริงแรงกว่าคาดการณ์ {rv_annualized*100:.1f}% vs {atm_iv*100:.1f}% ระวัง Breakout)"
+        else:
+            vol_regime_desc = f"สมดุล (IV {atm_iv*100:.1f}% สอดคล้องกับ RV {rv_annualized*100:.1f}%)"
+
+        return {
+            "rv_annualized": float(rv_annualized),
+            "bar_count": bar_count,
+            "iv_rv_spread": float(spread),
+            "vol_regime_desc": vol_regime_desc
+        }
+    except Exception as e:
+        print(f"[RV] Warning: compute_intraday_rv failed: {e}")
+        return {
+            "rv_annualized": float(atm_iv),
+            "bar_count": 0,
+            "iv_rv_spread": 0.0,
+            "vol_regime_desc": "ข้อมูล Intraday ไม่เพียงพอ (ใช้ค่า ATM IV อ้างอิง)"
+        }
+
+def compute_volume_profile(
+    pipeline_url: str,
+    auth_token: str,
+    target_date: str,
+    front_series: str,
+    tactical_levels: dict,
+    call_wall: float,
+    put_wall: float,
+    max_pain: float,
+    lookback_days: int = 20
+) -> dict:
+    """
+    Computes rolling up to 20-day Intraday Volume Profile for front quarter futures,
+    extracting Point of Control (POC), Value Area High (VAH), and Value Area Low (VAL).
+    Cross-checks POC/VAH/VAL with Options Walls and Max Pain for Confluence Zones.
+    """
+    try:
+        # 1. Fetch available trade dates in futures_snapshots (up to lookback_days)
+        sql_dates = """
+        SELECT DISTINCT SUBSTR(captured_at_bkk, 1, 10) as dt 
+        FROM futures_snapshots 
+        WHERE captured_at_bkk <= ? AND symbol = ?
+        ORDER BY dt DESC 
+        LIMIT ?;
+        """
+        _, rows_dates = execute_turso_sql(pipeline_url, auth_token, sql_dates, [f"{target_date} 23:59:59", front_series, lookback_days])
+        warmup_days = len(rows_dates)
+
+        if warmup_days == 0:
+            sql_dates_all = """
+            SELECT DISTINCT SUBSTR(captured_at_bkk, 1, 10) as dt 
+            FROM futures_snapshots 
+            WHERE captured_at_bkk <= ? 
+            ORDER BY dt DESC 
+            LIMIT ?;
+            """
+            _, rows_dates = execute_turso_sql(pipeline_url, auth_token, sql_dates_all, [f"{target_date} 23:59:59", lookback_days])
+            warmup_days = len(rows_dates)
+
+        if warmup_days == 0:
+            return {
+                "poc": max_pain,
+                "vah": max_pain + 5.0,
+                "val": max_pain - 5.0,
+                "warmup_days": 0,
+                "confluence_text": "กำลังสะสมข้อมูล Intraday (ยังไม่มีบาร์ในระบบ)"
+            }
+
+        min_date = rows_dates[-1][0]
+        max_date = rows_dates[0][0]
+
+        # 2. Fetch 1-minute records across these dates
+        sql_bars = """
+        SELECT captured_at_bkk, last, volume 
+        FROM futures_snapshots 
+        WHERE symbol = ? AND SUBSTR(captured_at_bkk, 1, 10) >= ? AND SUBSTR(captured_at_bkk, 1, 10) <= ?
+        ORDER BY captured_at_bkk ASC;
+        """
+        _, rows_bars = execute_turso_sql(pipeline_url, auth_token, sql_bars, [front_series, min_date, max_date])
+
+        if not rows_bars:
+            return {
+                "poc": max_pain,
+                "vah": max_pain + 5.0,
+                "val": max_pain - 5.0,
+                "warmup_days": warmup_days,
+                "confluence_text": "กำลังสะสมข้อมูล Intraday"
+            }
+
+        # 3. Aggregate volume by price
+        vol_by_price = {}
+        prev_vol = None
+        prev_day = None
+
+        for r in rows_bars:
+            ts = str(r[0])
+            day_str = ts[:10]
+            px = float(r[1]) if r[1] is not None else 0.0
+            tot_v = float(r[2]) if r[2] is not None else 0.0
+
+            if px <= 0:
+                continue
+
+            if prev_day != day_str:
+                prev_day = day_str
+                delta_v = 1.0
+                prev_vol = tot_v
+            else:
+                if prev_vol is not None and tot_v >= prev_vol:
+                    delta_v = tot_v - prev_vol
+                else:
+                    delta_v = 1.0
+                prev_vol = tot_v
+
+            k = round(px)
+            vol_by_price[k] = vol_by_price.get(k, 0.0) + max(1.0, delta_v)
+
+        if not vol_by_price:
+            return {
+                "poc": max_pain,
+                "vah": max_pain + 5.0,
+                "val": max_pain - 5.0,
+                "warmup_days": warmup_days,
+                "confluence_text": "กำลังสะสมข้อมูล Intraday"
+            }
+
+        total_v = sum(vol_by_price.values())
+        poc = max(vol_by_price.keys(), key=lambda k: vol_by_price[k])
+
+        sorted_prices = sorted(vol_by_price.keys())
+        poc_idx = sorted_prices.index(poc)
+        va_prices = {poc}
+        current_v = vol_by_price[poc]
+        target_v = 0.70 * total_v
+
+        up_idx = poc_idx + 1
+        down_idx = poc_idx - 1
+
+        while current_v < target_v and (up_idx < len(sorted_prices) or down_idx >= 0):
+            vol_up = vol_by_price[sorted_prices[up_idx]] if up_idx < len(sorted_prices) else -1
+            vol_down = vol_by_price[sorted_prices[down_idx]] if down_idx >= 0 else -1
+
+            if vol_up >= vol_down and up_idx < len(sorted_prices):
+                va_prices.add(sorted_prices[up_idx])
+                current_v += vol_up
+                up_idx += 1
+            elif down_idx >= 0:
+                va_prices.add(sorted_prices[down_idx])
+                current_v += vol_down
+                down_idx -= 1
+            else:
+                break
+
+        vah = max(va_prices)
+        val = min(va_prices)
+
+        # 4. Cross-check Confluence Zone with Options levels
+        opts_levels = [
+            ("Max Pain", max_pain),
+            ("Call Wall", call_wall),
+            ("Put Wall", put_wall),
+            ("ต้าน 1", tactical_levels.get("res_1", 930)),
+            ("รับ 1", tactical_levels.get("sup_1", 910)),
+        ]
+
+        confluences = []
+        for name, lvl in opts_levels:
+            if abs(poc - lvl) <= 3.0:
+                confluences.append(f"POC ({poc:.0f}) ชน {name} ({lvl:.0f}) ➔ ปะทะหลัก")
+            elif abs(vah - lvl) <= 3.0:
+                confluences.append(f"VAH ({vah:.0f}) ชน {name} ({lvl:.0f}) ➔ ต้านคอนกรีต")
+            elif abs(val - lvl) <= 3.0:
+                confluences.append(f"VAL ({val:.0f}) ชน {name} ({lvl:.0f}) ➔ รับคอนกรีต")
+
+        confluence_text = " | ".join(confluences[:2]) if confluences else "กรอบ Volume Profile สอดคล้องกับการเคลื่อนไหวในวัน"
+
+        return {
+            "poc": float(poc),
+            "vah": float(vah),
+            "val": float(val),
+            "warmup_days": warmup_days,
+            "confluence_text": confluence_text
+        }
+    except Exception as e:
+        print(f"[VOL_PROFILE] Warning: compute_volume_profile failed: {e}")
+        return {
+            "poc": max_pain,
+            "vah": max_pain + 5.0,
+            "val": max_pain - 5.0,
+            "warmup_days": 0,
+            "confluence_text": "ข้อมูล Volume Profile ไม่เพียงพอ"
+        }
+
+def analyze_late_session_flow(
+    pipeline_url: str,
+    auth_token: str,
+    trade_date: str,
+    front_series: str,
+    foreign_net: int
+) -> dict:
+    """
+    Examines the last 25 minutes (16:30 - 16:55) of trading on trade_date.
+    Analyzes price trajectory, Futures-Spot Basis expansion/contraction,
+    and interprets market closing pressure combined with Foreign Net flow.
+    """
+    try:
+        start_ts = f"{trade_date} 16:30:00"
+        end_ts = f"{trade_date} 16:55:00"
+
+        sql_fut = """
+        SELECT captured_at_bkk, last 
+        FROM futures_snapshots 
+        WHERE symbol = ? AND captured_at_bkk >= ? AND captured_at_bkk <= ? AND last IS NOT NULL AND last > 0 
+        ORDER BY captured_at_bkk ASC;
+        """
+        _, rows_fut = execute_turso_sql(pipeline_url, auth_token, sql_fut, [front_series, start_ts, end_ts])
+
+        sql_spot = """
+        SELECT captured_at_bkk, last 
+        FROM spot_snapshots 
+        WHERE symbol = 'SET50' AND captured_at_bkk >= ? AND captured_at_bkk <= ? AND last IS NOT NULL AND last > 0 
+        ORDER BY captured_at_bkk ASC;
+        """
+        _, rows_spot = execute_turso_sql(pipeline_url, auth_token, sql_spot, [start_ts, end_ts])
+
+        if not rows_fut or len(rows_fut) < 2:
+            return {
+                "late_fut_delta": 0.0,
+                "late_basis_close": 0.0,
+                "late_basis_delta": 0.0,
+                "late_session_desc": "⚪ ข้อมูลท้ายตลาดยังไม่เพียงพอในการตรวจจับแรงปิด"
+            }
+
+        f_start = float(rows_fut[0][1])
+        f_close = float(rows_fut[-1][1])
+        late_fut_delta = f_close - f_start
+
+        spot_dict = {str(r[0]): float(r[1]) for r in rows_spot if r[1] is not None}
+        s_start = spot_dict.get(str(rows_fut[0][0]), f_start)
+        s_close = spot_dict.get(str(rows_fut[-1][0]), f_close)
+
+        basis_start = f_start - s_start
+        basis_close = f_close - s_close
+        late_basis_delta = basis_close - basis_start
+
+        if foreign_net > 0 and late_fut_delta > 0.3 and late_basis_delta >= 0:
+            late_session_desc = "🟢 ต่างชาติซื้อ + ท้ายตลาดไล่ราคา Basis ขยับขึ้น ปิดใกล้ High มีโอกาสเปิดบวกต่อ"
+        elif foreign_net < 0 and late_fut_delta < -0.3 and late_basis_delta <= 0:
+            late_session_desc = "🔴 ต่างชาติขาย + มีแรงทิ้งสัญญาท้ายตลาด Basis หดตัว ระวังแรงกดดันต่อเนื่อง"
+        elif late_fut_delta > 0.5:
+            late_session_desc = "🟢 มีแรงซื้อเร่งดึงราคาท้ายตลาด ดันดัชนีปิดโซนบน"
+        elif late_fut_delta < -0.5:
+            late_session_desc = "🔴 มีแรงขายกดราคาท้ายตลาด ดัชนีปิดโซนล่าง"
+        else:
+            late_session_desc = "⚪ ท้ายตลาดทรงตัวในกรอบ Basis ปกติ ไม่มีแรงเร่งผิดปกติ"
+
+        return {
+            "late_fut_delta": float(late_fut_delta),
+            "late_basis_close": float(basis_close),
+            "late_basis_delta": float(late_basis_delta),
+            "late_session_desc": late_session_desc
+        }
+    except Exception as e:
+        print(f"[LATE_SESSION] Warning: analyze_late_session_flow failed: {e}")
+        return {
+            "late_fut_delta": 0.0,
+            "late_basis_close": 0.0,
+            "late_basis_delta": 0.0,
+            "late_session_desc": "⚪ ไม่สามารถดึงข้อมูลช่วงท้ายตลาดได้"
+        }
+
+# ==============================================================================
 # RULE-BASED THAI TRADING PLAYBOOK GENERATOR
 # ==============================================================================
 
@@ -742,15 +1091,19 @@ def generate_thai_trading_playbook(
     flow_regime: str,
     flow_emoji: str,
     foreign_footprint: dict = None,
-    options_footprint: dict = None
+    options_footprint: dict = None,
+    intraday_rv: dict = None,
+    volume_profile: dict = None,
+    late_session: dict = None
 ) -> str:
     """
     Constructs an actionable, rule-based frontline trading plan in Thai.
-    4 Core Pillars:
+    5 Core Pillars:
     1. 1-Day Expected Move (1-SD)
-    2. Tactical Key Levels (Ranked nearest to current price)
-    3. Smart Money Flow & Footprint Breakdown
-    4. Daily Action Plan & Institutional Defense Level
+    2. Tactical Key Levels & Quarter Walls
+    3. Intraday Structure & Realized Volatility (Warm-up 20D)
+    4. Smart Money Flow & Footprint Breakdown
+    5. Daily Action Plan & Institutional Defense Level
     """
     res_1 = tactical_levels["res_1"]
     res_1_oi = tactical_levels["res_1_oi"]
@@ -765,7 +1118,7 @@ def generate_thai_trading_playbook(
     if atm_iv < 0.10:
         iv_desc = "ความผันผวนต่ำมาก ตลาดมักบีบกรอบแคบ"
     elif atm_iv <= 0.15:
-        iv_desc = "ความผันผวนปกติ เหมาะแก่การเทรดตามกรอบ"
+        iv_desc = "ความผันผวนปกติ เหมาะเทรดในกรอบ"
     else:
         iv_desc = "ความผันผวนสูง แกว่งกว้าง ควรกระชับจุดคัต"
 
@@ -773,31 +1126,31 @@ def generate_thai_trading_playbook(
 
     # 2. Smart Money Translation & Actionable Playbook Logic
     if foreign_net > 0 and delta_oi > 0:
-        flow_title = "New Long Build-up (ต่างชาติเปิดสะสม Long สัญญาใหม่)"
-        flow_detail = f"ต่างชาติซื้อสุทธิ <code>{foreign_net:+,}</code> สัญญา พร้อม OI ขยายตัว <code>{delta_oi:+,}</code> สัญญา เป็นการเปิดสถานะ Long ใหม่หนุนตลาดขึ้นอย่างแท้จริง"
+        flow_title = "New Long Build-up (ต่างชาติเปิดสะสม Long ใหม่)"
+        flow_detail = f"ต่างชาติซื้อสุทธิ <code>{foreign_net:+,}</code> สัญญา พร้อม OI ขยาย <code>{delta_oi:+,}</code> เป็นการเปิด Long หนุนตลาดขึ้นแท้จริง"
         flow_caution = f"หากผ่านต้าน 1 (<code>{res_1:.0f}</code>) ได้ โมเมนตัมจะพาไปทดสอบ Upper 1-SD หรือต้าน 2 (<code>{res_2:.0f}</code>)"
         action_strategy = "Follow-Through ฝั่ง Long ตามโมเมนตัม ไม่ดักสวนเทรนด์"
-        long_plan = f"รอจังหวะย่อตัวแถว รับ 1 (<code>{sup_1:.0f}</code>) หรือราคาเปิด หากยืนได้เปิด Long เป้าหมาย <code>{res_1:.0f}</code> และ <code>{upper_1sd:.1f}</code>"
+        long_plan = f"รอจังหวะย่อตัวแถว รับ 1 (<code>{sup_1:.0f}</code>) หรือราคาเปิด ยืนได้เปิด Long เป้าหมาย <code>{res_1:.0f}</code> และ <code>{upper_1sd:.1f}</code>"
         short_plan = f"ชะลอการ Short จนกว่าจะขึ้นทดสอบ ต้าน 2 (<code>{res_2:.0f}</code>) หรือ Upper 1-SD แล้วเกิดสัญญาณ Rejection ไม่ผ่าน"
         stop_loss_plan = f"ฝั่ง Long วาง Stop Loss เมื่อราคาหลุด <code>{min(sup_2, f_cost):.0f}</code> จุด (แนว Defense ฝรั่ง)"
     elif foreign_net > 0 and delta_oi < 0:
-        flow_title = "Short Covering (ต่างชาติปิดทำกำไร/ลดพอร์ต Short)"
-        flow_detail = f"ต่างชาติซื้อสุทธิ <code>{foreign_net:+,}</code> สัญญา แต่ OI หดตัว <code>{delta_oi:+,}</code> สัญญา เป็นแรงซื้อคืนเพื่อปิดสัญญา Short เดิม"
+        flow_title = "Short Covering (ต่างชาติปิดทำกำไร Short)"
+        flow_detail = f"ต่างชาติซื้อสุทธิ <code>{foreign_net:+,}</code> สัญญา แต่ OI หดตัว <code>{delta_oi:+,}</code> สัญญา เป็นแรงซื้อคืนปิดสัญญา Short เดิม"
         flow_caution = f"การดีดตัวอาจเป็นเพียง Technical Rebound ระยะสั้น ระวังแรงขายทำกำไรบริเวณแนวต้าน ต้าน 1 หรือ Max Pain (<code>{max_pain:.0f}</code>)"
         action_strategy = "เน้นเล่นรอบในกรอบ (Range-Bound / Mean Reversion) ดักย่อซื้อ-เด้งขาย ไม่ไล่ราคา"
         long_plan = f"รอตั้งรับบริเวณ Lower 1-SD (<code>{lower_1sd:.1f}</code>) หรือ รับ 1 (<code>{sup_1:.0f}</code>) เป้าทำกำไรที่ Max Pain (<code>{max_pain:.0f}</code>) หรือ ต้าน 1"
         short_plan = f"หากเปิดกระโดดขึ้นทดสอบ ต้าน 1 (<code>{res_1:.0f}</code>) หรือ Upper 1-SD (<code>{upper_1sd:.1f}</code>) แล้วไม่ผ่าน พิจารณาดัก Short เล่นรอบย่อ"
         stop_loss_plan = f"ฝั่ง Long คัตเมื่อหลุด <code>{sup_2:.0f}</code> | ฝั่ง Short คัตเมื่อทะลุเหนือ <code>{res_1 + 3.0:.1f}</code>"
     elif foreign_net < 0 and delta_oi > 0:
-        flow_title = "New Short Build-up (ต่างชาติเปิดสะสม Short สัญญาใหม่)"
-        flow_detail = f"ต่างชาติขายสุทธิ <code>{foreign_net:+,}</code> สัญญา และ OI ขยายตัว <code>{delta_oi:+,}</code> สัญญา สะท้อนการเปิด Short เพิ่มเพื่อเก็งกำไรขาลง"
+        flow_title = "New Short Build-up (ต่างชาติเปิดสะสม Short ใหม่)"
+        flow_detail = f"ต่างชาติขายสุทธิ <code>{foreign_net:+,}</code> สัญญา และ OI ขยาย <code>{delta_oi:+,}</code> สัญญา สะท้อนการเปิด Short เพิ่มเพื่อเก็งกำไรขาลง"
         flow_caution = f"แรงกดดันฝั่งขายสูง หากหลุด รับ 1 (<code>{sup_1:.0f}</code>) ดีลเลอร์จะเร่งขายตาม เสี่ยงไหลลงทดสอบ Lower 1-SD"
         action_strategy = "เน้นฝั่ง Short (Trend Expansion Down) ตามน้ำ ระวังการหลุดแนวรับแล้วรูดแรง"
-        long_plan = f"หลีกเลี่ยงการดักสวนรับเร็ว (มีดตก) จนกว่าราคาจะลงแตะ รับ 2 (<code>{sup_2:.0f}</code>) หรือ Lower 1-SD แล้วเกิดสัญญาณหยุดลง"
+        long_plan = f"หลีกเลี่ยงการดักสวนรับเร็ว จนกว่าราคาจะแตะ รับ 2 (<code>{sup_2:.0f}</code>) หรือ Lower 1-SD แล้วเกิดสัญญาณหยุดลง"
         short_plan = f"เด้งขึ้นทดสอบ ต้าน 1 (<code>{res_1:.0f}</code>) หรือ Max Pain (<code>{max_pain:.0f}</code>) ไม่ผ่าน เปิด Short เป้าหมาย <code>{sup_1:.0f}</code> และ <code>{lower_1sd:.1f}</code>"
         stop_loss_plan = f"ฝั่ง Short วาง Stop Loss เหนือ <code>{max(res_1 + 2.5, f_cost):.1f}</code> จุด"
     elif foreign_net < 0 and delta_oi < 0:
-        flow_title = "Long Liquidation (ต่างชาติปิดทำกำไร/ลดพอร์ต Long)"
+        flow_title = "Long Liquidation (ต่างชาติปิดลดพอร์ต Long)"
         flow_detail = f"ต่างชาติขายสุทธิ <code>{foreign_net:+,}</code> สัญญา ควบคู่กับ OI ลดลง <code>{delta_oi:+,}</code> สัญญา เป็นการปิดสัญญาลดความเสี่ยง"
         flow_caution = f"ตลาดขาดแรงซื้อหนุน ตราบใดที่ยังไม่ยืนเหนือต้าน 1 (<code>{res_1:.0f}</code>) ให้ระวังการซึมลง"
         action_strategy = "เทรดรอบสั้นอย่างระมัดระวัง เน้นตั้งรับต่ำและไม่ไล่ราคา"
@@ -816,6 +1169,36 @@ def generate_thai_trading_playbook(
     gamma_flip_str = f"{gamma_flip_val:.1f}" if not math.isnan(gamma_flip_val) else "N/A"
     gamma_emoji = "🛡️" if is_positive_gamma else "⚡"
 
+    # Format Intraday & Realized Volatility Block
+    if intraday_rv and volume_profile and late_session:
+        rv_ann = intraday_rv.get("rv_annualized", atm_iv)
+        bar_count = intraday_rv.get("bar_count", 0)
+        vol_regime_desc = intraday_rv.get("vol_regime_desc", "N/A")
+
+        poc = volume_profile.get("poc", futures_ref)
+        vah = volume_profile.get("vah", futures_ref + 5)
+        val = volume_profile.get("val", futures_ref - 5)
+        warmup_days = volume_profile.get("warmup_days", 0)
+        confluence_text = volume_profile.get("confluence_text", "N/A")
+
+        late_fut_delta = late_session.get("late_fut_delta", 0.0)
+        late_basis_close = late_session.get("late_basis_close", 0.0)
+        late_basis_delta = late_session.get("late_basis_delta", 0.0)
+        late_session_desc = late_session.get("late_session_desc", "N/A")
+
+        intraday_block = f"""📊 <b>3. โครงสร้าง Intraday & ความผันผวน (Warm-up: {warmup_days}/20 วัน)</b>
+• <b>Realized vs Implied Vol:</b> RV <code>{rv_ann * 100:.2f}%</code> vs ATM IV <code>{atm_iv * 100:.2f}%</code> ({bar_count} บาร์)
+  └ <i>สภาวะ: {vol_regime_desc}</i>
+• <b>Intraday Volume Profile:</b>
+  - <b>POC:</b> <code>{poc:.0f}</code> จุด | <b>Value Area (70%):</b> <code>{val:.0f}</code> – <code>{vah:.0f}</code> จุด
+  - <b>Confluence Zone:</b> {confluence_text}
+• <b>พฤติกรรมท้ายตลาด (16:30–16:55 น.):</b>
+  - Futures: <code>{late_fut_delta:+.1f}</code> จุด | Basis ปิด: <code>{late_basis_close:+.2f}</code> (ΔBasis: <code>{late_basis_delta:+.2f}</code>)
+  - <i>บทสรุป: {late_session_desc}</i>
+"""
+    else:
+        intraday_block = ""
+
     # Format Foreign Footprint
     if foreign_footprint:
         f_cum = foreign_footprint.get("cum_foreign_net", 0)
@@ -824,9 +1207,8 @@ def generate_thai_trading_playbook(
         f_div_text = foreign_footprint.get("divergence_text", "N/A")
         f_days = foreign_footprint.get("history_days", 60)
         foreign_footprint_block = f"""• <b>สถิติแกะรอยต่างชาติสะสม ({f_days} วันทำการ):</b>
-  - ยอดสะสมสุทธิ: <code>{f_cum:+,}</code> สัญญา | ต้นทุนเฉลี่ย: <code>{f_cost:.1f}</code> จุด <i>({f_pnl_status})</i>
-  - สถิติ Flow Z-Score (20 วัน): {f_z_desc}
-  - สัญญาณขัดแย้งราคา (5 วัน): {f_div_text}"""
+  - ยอดสะสม: <code>{f_cum:+,}</code> สัญญา | ต้นทุนเฉลี่ย: <code>{f_cost:.1f}</code> จุด <i>({f_pnl_status})</i>
+  - Flow Z-Score (20 วัน): {f_z_desc} | Divergence: {f_div_text}"""
     else:
         foreign_footprint_block = ""
 
@@ -843,8 +1225,8 @@ def generate_thai_trading_playbook(
         top_p_div = options_footprint.get("top_put_div", 0.0)
         p_intent = options_footprint.get("put_intent", "N/A")
 
-        options_footprint_block = f"""• <b>Options Strike Footprint (พอร์ตต่างชาติ & Strike เด่น):</b>
-  - ยอดต่างชาติ Options: Call <code>{o_c_net:+,}</code> | Put <code>{o_p_net:+,}</code> สัญญา
+        options_footprint_block = f"""• <b>Options Strike Footprint:</b>
+  - ต่างชาติ Options: Call <code>{o_c_net:+,}</code> | Put <code>{o_p_net:+,}</code> สัญญา
   - Call เด่น: Strike <code>{top_c_k:.0f}</code> (ΔOI: <code>{top_c_doi:+,}</code>, ΔIV: <code>{top_c_div:+.2f}%</code>) ➔ <i>{c_intent}</i>
   - Put เด่น: Strike <code>{top_p_k:.0f}</code> (ΔOI: <code>{top_p_doi:+,}</code>, ΔIV: <code>{top_p_div:+.2f}%</code>) ➔ <i>{p_intent}</i>"""
     else:
@@ -853,47 +1235,45 @@ def generate_thai_trading_playbook(
     # Format Institutional Cost Narrative for Action Plan
     if foreign_footprint and f_cost > 0:
         if futures_ref >= f_cost:
-            cost_relation = f"ราคาปัจจุบัน ({futures_ref:.1f}) ยืนเหนือต้นทุนเฉลี่ยสะสมฝรั่ง ({f_cost:.1f}) ซึ่งทำหน้าที่เป็นแนวรับเชิงจิตวิทยา/Defense Level สำคัญ"
+            cost_relation = f"ราคายืนเหนือต้นทุนเฉลี่ยฝรั่ง ({f_cost:.1f}) ทำหน้าที่เป็นแนวรับจิตวิทยา (Defense Line)"
         else:
-            cost_relation = f"ราคาปัจจุบัน ({futures_ref:.1f}) อยู่ต่ำกว่าต้นทุนเฉลี่ยสะสมฝรั่ง ({f_cost:.1f}) ต่างชาติติดดอย อาจมีแรงขายลดความเสี่ยงเมื่อราคาเด้งทดสอบ {f_cost:.1f}"
+            cost_relation = f"ราคาต่ำกว่าต้นทุนเฉลี่ยฝรั่ง ({f_cost:.1f}) ต่างชาติติดดอย ระวังแรงขายลดเสี่ยงเมื่อชน {f_cost:.1f}"
         cost_narrative = f"""• <b>แนวปะทะต้นทุนสถาบัน (Institutional Cost Line):</b> <code>{f_cost:.1f}</code> จุด
   <i>({cost_relation})</i>
 """
     else:
         cost_narrative = ""
 
+    if is_positive_gamma:
+        gamma_desc_compact = f"ราคาเหนือ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Long Gamma ซับแรงเหวี่ยง มักแกว่งในกรอบ"
+    else:
+        gamma_desc_compact = f"ราคาใต้ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Short Gamma หลุดรับจะเร่งแรงขาย ผันผวนสูง"
+
     msg = f"""🎯 <b>แผนการเทรด SET50 ประจำวัน | TFEX QUANT RADAR</b>
 📅 <i>ข้อมูลสิ้นวัน {trade_date} | ออกรายงานเช้า {as_of_time_bkk} น.</i>
 ━━━━━━━━━━━━━━━━━━━━━━
 🎯 <b>1. กรอบวิ่งคาดการณ์วันนี้ (1-Day Expected Move)</b>
-• <b>กรอบบน (Upper 1-SD):</b> <code>{upper_1sd:.1f}</code> จุด
-• <b>กรอบล่าง (Lower 1-SD):</b> <code>{lower_1sd:.1f}</code> จุด
-• <b>ระยะแกว่งตัวคาดการณ์ (1-SD):</b> <code>±{expected_move_1d:.1f}</code> จุด
+• <b>กรอบราคา 1-SD:</b> <code>{lower_1sd:.1f}</code> – <code>{upper_1sd:.1f}</code> จุด <i>(ระยะแกว่ง ±{expected_move_1d:.1f} จุด)</i>
 • <b>ระดับความผันผวน (ATM IV):</b> <code>{atm_iv * 100:.2f}%</code> <i>({iv_desc})</i>
 
 🧱 <b>2. แนวรับ - แนวต้านสำคัญรายวัน (Tactical Key Levels)</b>
-🔴 <b>ต้าน 2:</b> <code>{res_2:.0f}</code> จุด <i>(Call OI: {res_2_oi:,} สัญญา)</i>
-🔴 <b>ต้าน 1:</b> <code>{res_1:.0f}</code> จุด <i>(Call OI: {res_1_oi:,} สัญญา)</i>
-🎯 <b>Max Pain:</b> <code>{max_pain:.0f}</code> จุด <i>(ระดับดึงดูดราคาหมดอายุ)</i>
-📍 <b>ราคาปิดล่าสุด ({front_series}):</b> <code>{futures_ref:.1f}</code> จุด
-🟢 <b>รับ 1:</b> <code>{sup_1:.0f}</code> จุด <i>(Put OI: {sup_1_oi:,} สัญญา)</i>
-🟢 <b>รับ 2:</b> <code>{sup_2:.0f}</code> จุด <i>(Put OI: {sup_2_oi:,} สัญญา)</i>
+🔴 <b>ต้าน 2:</b> <code>{res_2:.0f}</code> <i>({res_2_oi:,})</i> | <b>ต้าน 1:</b> <code>{res_1:.0f}</code> <i>({res_1_oi:,})</i>
+📍 <b>ราคาปิดล่าสุด ({front_series}):</b> <code>{futures_ref:.1f}</code> จุด <i>(Max Pain: <code>{max_pain:.0f}</code>)</i>
+🟢 <b>รับ 1:</b> <code>{sup_1:.0f}</code> <i>({sup_1_oi:,})</i> | <b>รับ 2:</b> <code>{sup_2:.0f}</code> <i>({sup_2_oi:,})</i>
 ───────────────
 🏛️ <i>กรอบใหญ่ไตรมาส: Put Wall <code>{put_wall:.0f}</code> – Call Wall <code>{call_wall:.0f}</code> | Gamma Flip: <code>{gamma_flip_str}</code></i>
 
-🌊 <b>3. พฤติกรรมรายใหญ่ (Smart Money Flow & Footprint)</b>
+{intraday_block}
+🌊 <b>4. พฤติกรรมรายใหญ่ (Smart Money Flow & Footprint)</b>
 • <b>สถานะ Flow:</b> {flow_emoji} <b>{flow_title}</b>
-• <b>การวิเคราะห์:</b> {flow_detail}
-• <b>ข้อควรระวัง:</b> {flow_caution}
-• <b>ยอดซื้อขายสุทธิรายกลุ่ม (วันล่าสุด):</b>
-  - ต่างชาติ (Foreign): <code>{foreign_net:+,}</code> สัญญา (ΔOI: <code>{delta_oi:+,}</code>)
-  - กองทุน (Institution): <code>{inst_net:+,}</code> | รายย่อย (Local): <code>{local_net:+,}</code>
+  <i>({flow_detail})</i>
+• <b>ยอดซื้อขายรายกลุ่ม:</b> ต่างชาติ <code>{foreign_net:+,}</code> (ΔOI: <code>{delta_oi:+,}</code>) | กองทุน <code>{inst_net:+,}</code> | รายย่อย <code>{local_net:+,}</code>
 {foreign_footprint_block}
 {options_footprint_block}
 
-⚔️ <b>4. กลยุทธ์และแผนการเล่นวันนี้ (Daily Action Plan)</b>
+⚔️ <b>5. กลยุทธ์และแผนการเล่นวันนี้ (Daily Action Plan)</b>
 • <b>สภาวะตลาด (Dealer Gamma):</b> {gamma_emoji} <b>{gamma_zone_title}</b>
-  <i>({gamma_desc})</i>
+  <i>({gamma_desc_compact})</i>
 {cost_narrative}• <b>แผนการปฏิบัติหน้างาน:</b>
   💡 <b>กลยุทธ์หลัก:</b> {action_strategy}
   🟢 <b>ฝั่ง Long:</b> {long_plan}
@@ -1234,9 +1614,9 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
             "pnl_pts": 3.7,
             "pnl_status": "กำไร (+3.7 จุด)",
             "z_score": 1.68,
-            "z_desc": "🚨 ผิดปกติอย่างมีนัยสำคัญ (ซื้อหนักผิดปกติ Outlier: Z = +1.68 SD)",
+            "z_desc": "🚨 Outlier ซื้อหนัก (Z = +1.68 SD)",
             "is_outlier": True,
-            "divergence_text": "สอดคล้องกับทิศทางราคา (Confluent Direction)",
+            "divergence_text": "สอดคล้องกับราคา (Confluent)",
             "history_days": 60
         }
         mock_options_footprint = {
@@ -1245,11 +1625,32 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
             "top_call_strike": 930.0,
             "top_call_doi": 1850,
             "top_call_div": 0.85,
-            "call_intent": "Aggressive Call Buying (เก็งกำไรขาขึ้นทะลุต้าน)",
+            "call_intent": "Aggressive Call Buying (เก็งกำไรทะลุต้าน)",
             "top_put_strike": 900.0,
             "top_put_doi": 2400,
             "top_put_div": -0.35,
-            "put_intent": "Put Writing / Floor Support (ขาย Put ล็อกฐานแนวรับ)"
+            "put_intent": "Put Writing / Floor Support (ขาย Put ล็อกฐานรับ)"
+        }
+
+        # Mock Intraday Warm-up Analytics for Phase 2
+        mock_intraday_rv = {
+            "rv_annualized": 0.1045,
+            "bar_count": 320,
+            "iv_rv_spread": (atm_iv - 0.1045) * 100.0,
+            "vol_regime_desc": f"IV Premium สูง (Options แพงกว่าแกว่งจริง +{(atm_iv - 0.1045) * 100.0:.1f}% เหมาะเทรดในกรอบ)"
+        }
+        mock_volume_profile = {
+            "poc": 917.0,
+            "vah": 922.0,
+            "val": 912.0,
+            "warmup_days": 20,
+            "confluence_text": f"POC (917) รับราคาปิด | VAH (922) ชน Max Pain ({max_pain:.0f}) ➔ ต้านคอนกรีต"
+        }
+        mock_late_session = {
+            "late_fut_delta": 1.2,
+            "late_basis_close": -1.85,
+            "late_basis_delta": 0.45,
+            "late_session_desc": "🟢 ต่างชาติซื้อ + ท้ายตลาดไล่ราคา Basis ขยับขึ้น ปิดใกล้ High มีโอกาสเปิดบวกต่อ"
         }
 
         html_file = build_interactive_dashboard(
@@ -1270,7 +1671,10 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
             foreign_net=foreign_net, delta_oi=delta_oi, inst_net=inst_net, local_net=local_net,
             flow_regime=flow_regime, flow_emoji=flow_emoji,
             foreign_footprint=mock_foreign_footprint,
-            options_footprint=mock_options_footprint
+            options_footprint=mock_options_footprint,
+            intraday_rv=mock_intraday_rv,
+            volume_profile=mock_volume_profile,
+            late_session=mock_late_session
         )
 
         print("\n" + "=" * 75)
@@ -1626,6 +2030,43 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
     print(f"[FOOTPRINT] Top Call Expansion: Strike {options_footprint['top_call_strike']:.0f} (ΔOI: {options_footprint['top_call_doi']:+,}, ΔIV: {options_footprint['top_call_div']:+.2f}%) -> {options_footprint['call_intent']}")
     print(f"[FOOTPRINT] Top Put Expansion : Strike {options_footprint['top_put_strike']:.0f} (ΔOI: {options_footprint['top_put_doi']:+,}, ΔIV: {options_footprint['top_put_div']:+.2f}%) -> {options_footprint['put_intent']}")
 
+    # 7.2 Intraday Warm-up Analytics (Realized Volatility, Volume Profile, Late-Session Flow)
+    print("[INTRADAY] Computing Annualized Realized Volatility (RV) from 1-min bars...")
+    intraday_rv = compute_intraday_rv(
+        pipeline_url=pipeline_url,
+        auth_token=turso_token,
+        trade_date=t_0,
+        front_series=front_series,
+        atm_iv=atm_iv
+    )
+    print(f"[INTRADAY] Realized Vol: {intraday_rv['rv_annualized']*100:.2f}% (Bars: {intraday_rv['bar_count']}) vs ATM IV: {atm_iv*100:.2f}% | Spread: {intraday_rv['iv_rv_spread']:+.2f}%")
+
+    print("[INTRADAY] Computing 20-Day Rolling Volume Profile (POC, VAH, VAL)...")
+    volume_profile = compute_volume_profile(
+        pipeline_url=pipeline_url,
+        auth_token=turso_token,
+        target_date=t_0,
+        front_series=front_series,
+        tactical_levels=tactical_levels,
+        call_wall=call_wall,
+        put_wall=put_wall,
+        max_pain=max_pain,
+        lookback_days=20
+    )
+    print(f"[INTRADAY] Volume Profile ({volume_profile['warmup_days']}/20 days): POC={volume_profile['poc']:.0f}, VAH={volume_profile['vah']:.0f}, VAL={volume_profile['val']:.0f}")
+    print(f"[INTRADAY] Confluence: {volume_profile['confluence_text']}")
+
+    print("[INTRADAY] Analyzing Late-Session (16:30 - 16:55) Futures & Basis Flow...")
+    late_session = analyze_late_session_flow(
+        pipeline_url=pipeline_url,
+        auth_token=turso_token,
+        trade_date=t_0,
+        front_series=front_series,
+        foreign_net=foreign_net
+    )
+    print(f"[INTRADAY] Late Session: ΔFutures={late_session['late_fut_delta']:+.1f}, Basis Close={late_session['late_basis_close']:+.2f} (ΔBasis={late_session['late_basis_delta']:+.2f})")
+    print(f"[INTRADAY] Late Session Signal: {late_session['late_session_desc']}")
+
     # 8. Interactive HTML Dashboard Generation
     html_file = build_interactive_dashboard(
         trade_date=t_0,
@@ -1674,7 +2115,10 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         flow_regime=flow_regime,
         flow_emoji=flow_emoji,
         foreign_footprint=foreign_footprint,
-        options_footprint=options_footprint
+        options_footprint=options_footprint,
+        intraday_rv=intraday_rv,
+        volume_profile=volume_profile,
+        late_session=late_session
     )
 
     # 10. Persist Log to Turso Database
