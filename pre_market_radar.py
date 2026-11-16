@@ -380,6 +380,340 @@ def resolve_tactical_levels(res_df: pd.DataFrame, futures_ref: float, call_wall:
     }
 
 # ==============================================================================
+# SMART MONEY & OPTIONS STRIKE FOOTPRINT MODULES
+# ==============================================================================
+
+def analyze_foreign_footprint(
+    pipeline_url: str,
+    auth_token: str,
+    target_date: str,
+    front_series: str,
+    futures_ref: float,
+    lookback_days: int = 60
+) -> dict:
+    """
+    Analyzes historical Foreign Investor Flow and cost basis on SET50 Index Futures.
+    Tracks running inventory-weighted cost basis (resets when position flips side),
+    calculates 20-day rolling Flow Z-Score, and checks 5-day price-flow divergence.
+    """
+    try:
+        # 1. Fetch Foreign Net Futures history
+        sql_inv = """
+        SELECT trade_date, foreign_net 
+        FROM eod_investor_types 
+        WHERE category = 'Equity Index Futures' AND trade_date <= ? 
+        ORDER BY trade_date DESC 
+        LIMIT ?;
+        """
+        _, rows_inv = execute_turso_sql(pipeline_url, auth_token, sql_inv, [target_date, lookback_days])
+
+        # 2. Fetch settlement prices for front series
+        sql_px = """
+        SELECT trade_date, settlement_price 
+        FROM eod_futures_series 
+        WHERE series = ? AND trade_date <= ? 
+        ORDER BY trade_date DESC 
+        LIMIT ?;
+        """
+        _, rows_px = execute_turso_sql(pipeline_url, auth_token, sql_px, [front_series, target_date, lookback_days])
+        px_dict = {r[0]: float(r[1]) for r in rows_px if r[1] is not None}
+
+        # Fallback if front series was not active on older dates in lookback
+        if len(px_dict) < len(rows_inv):
+            sql_fb = """
+            SELECT trade_date, settlement_price 
+            FROM eod_futures_series 
+            WHERE trade_date <= ? 
+            GROUP BY trade_date 
+            ORDER BY trade_date DESC 
+            LIMIT ?;
+            """
+            _, rows_fb = execute_turso_sql(pipeline_url, auth_token, sql_fb, [target_date, lookback_days])
+            for r in rows_fb:
+                if r[0] not in px_dict and r[1] is not None:
+                    px_dict[r[0]] = float(r[1])
+
+        # Align chronological order (oldest to newest)
+        records = []
+        for r in sorted(rows_inv, key=lambda x: x[0]):
+            dt = r[0]
+            f_net = int(r[1] or 0)
+            px = px_dict.get(dt, futures_ref)
+            records.append({"date": dt, "foreign_net": f_net, "settlement_price": px})
+
+        if not records:
+            return {
+                "cum_foreign_net": 0,
+                "cost_basis": futures_ref,
+                "pnl_pts": 0.0,
+                "pnl_status": "ไม่มีข้อมูลย้อนหลัง",
+                "z_score": 0.0,
+                "z_desc": "ข้อมูลไม่เพียงพอ",
+                "is_outlier": False,
+                "divergence_text": "ไม่มีข้อมูล",
+                "history_days": 0
+            }
+
+        # Inventory-weighted cost basis calculation
+        cum_net = 0
+        cost_basis = futures_ref
+
+        for rec in records:
+            net_i = rec["foreign_net"]
+            px_i = rec["settlement_price"]
+            if net_i == 0:
+                continue
+
+            if cum_net == 0:
+                cost_basis = px_i
+                cum_net = net_i
+            elif (cum_net > 0 and net_i > 0) or (cum_net < 0 and net_i < 0):
+                # Expanding existing position
+                new_net = cum_net + net_i
+                cost_basis = (cum_net * cost_basis + net_i * px_i) / new_net
+                cum_net = new_net
+            else:
+                # Reducing or reversing position
+                if abs(net_i) < abs(cum_net):
+                    # Partial unwinding: cost basis remains unchanged
+                    cum_net += net_i
+                elif abs(net_i) == abs(cum_net):
+                    # Flat
+                    cum_net = 0
+                    cost_basis = px_i
+                else:
+                    # Position flipped to opposite side
+                    cum_net += net_i
+                    cost_basis = px_i
+
+        if cum_net == 0:
+            cost_basis = futures_ref
+
+        if cum_net > 0:
+            pnl_pts = futures_ref - cost_basis
+            pnl_status = f"กำไร (+{pnl_pts:.1f} จุด)" if pnl_pts >= 0 else f"ขาดทุน ({pnl_pts:.1f} จุด)"
+        elif cum_net < 0:
+            pnl_pts = cost_basis - futures_ref
+            pnl_status = f"กำไร (+{pnl_pts:.1f} จุด)" if pnl_pts >= 0 else f"ขาดทุน ({pnl_pts:.1f} จุด)"
+        else:
+            pnl_pts = 0.0
+            pnl_status = "พอร์ตว่าง / เท่าทุน"
+
+        # 20-day rolling Flow Z-Score
+        recent_flows = [r["foreign_net"] for r in records[-20:]]
+        latest_flow = recent_flows[-1] if recent_flows else 0
+        if len(recent_flows) >= 3:
+            m = float(np.mean(recent_flows))
+            s = float(np.std(recent_flows))
+            z_score = float((latest_flow - m) / s) if s > 1e-4 else 0.0
+        else:
+            z_score = 0.0
+
+        is_outlier = abs(z_score) >= 1.5
+        if is_outlier:
+            tag = "ซื้อหนักผิดปกติ" if z_score > 0 else "ขายหนักผิดปกติ"
+            z_desc = f"🚨 ผิดปกติอย่างมีนัยสำคัญ ({tag} Outlier: Z = {z_score:+.2f} SD)"
+        else:
+            z_desc = f"ปกติ (Z = {z_score:+.2f} SD เกาะกลุ่มค่าเฉลี่ย 20 วัน)"
+
+        # 5-day Price-Flow Divergence
+        n_div = min(5, len(records))
+        if n_div >= 2:
+            p_latest = records[-1]["settlement_price"]
+            p_prev5 = records[-n_div]["settlement_price"]
+            price_diff = p_latest - p_prev5
+            flow_sum_5d = sum(r["foreign_net"] for r in records[-n_div:])
+
+            if price_diff >= 3.0 and flow_sum_5d <= -5000:
+                divergence_text = f"⚠️ Bearish Divergence (ราคาขึ้น {price_diff:+.1f} แต่ต่างชาติเทขาย {flow_sum_5d:+,} สัญญา)"
+            elif price_diff <= -3.0 and flow_sum_5d >= 5000:
+                divergence_text = f"💡 Bullish Divergence (ราคาย่อตัว {price_diff:+.1f} แต่ต่างชาติทยอยช้อนซื้อ {flow_sum_5d:+,} สัญญา)"
+            elif (price_diff >= 0 and flow_sum_5d >= 0) or (price_diff <= 0 and flow_sum_5d <= 0):
+                divergence_text = "สอดคล้องกับทิศทางราคา (Confluent Direction)"
+            else:
+                divergence_text = "ไม่มีสัญญาณ Divergence เด่นชัด (Sideway / Neutral)"
+        else:
+            divergence_text = "ข้อมูลไม่เพียงพอสำหรับการวิเคราะห์ Divergence"
+
+        return {
+            "cum_foreign_net": int(cum_net),
+            "cost_basis": float(cost_basis),
+            "pnl_pts": float(pnl_pts),
+            "pnl_status": pnl_status,
+            "z_score": float(z_score),
+            "z_desc": z_desc,
+            "is_outlier": is_outlier,
+            "divergence_text": divergence_text,
+            "history_days": len(records)
+        }
+    except Exception as e:
+        print(f"[FOOTPRINT] Warning: analyze_foreign_footprint failed: {e}")
+        return {
+            "cum_foreign_net": 0,
+            "cost_basis": futures_ref,
+            "pnl_pts": 0.0,
+            "pnl_status": "Error",
+            "z_score": 0.0,
+            "z_desc": "เกิดข้อผิดพลาดในการดึงข้อมูล",
+            "is_outlier": False,
+            "divergence_text": "N/A",
+            "history_days": 0
+        }
+
+def analyze_options_footprint(
+    pipeline_url: str,
+    auth_token: str,
+    t_0: str,
+    t_minus_1: str,
+    front_series: str,
+    futures_ref_t0: float,
+    futures_ref_tprev: float,
+    T_front_t0: float,
+    T_front_tprev: float,
+    r_rf: float
+) -> dict:
+    """
+    Pairs Foreign Call/Put flow with strike-level delta OI and delta IV
+    between T_0 and T_-1 to uncover institutional options positioning intent.
+    """
+    try:
+        # 1. Fetch Foreign Options Net from eod_investor_types
+        sql_inv = """
+        SELECT category, foreign_net 
+        FROM eod_investor_types 
+        WHERE trade_date = ? AND category IN ('Equity Index Call Options', 'Equity Index Put Options');
+        """
+        _, rows_inv = execute_turso_sql(pipeline_url, auth_token, sql_inv, [t_0])
+        f_call_net = 0
+        f_put_net = 0
+        for r in rows_inv:
+            cat = str(r[0])
+            val = int(r[1] or 0)
+            if "Call" in cat:
+                f_call_net = val
+            elif "Put" in cat:
+                f_put_net = val
+
+        # 2. Fetch Options Series at T_0 and T_-1 for front_series
+        sql_opts = """
+        SELECT option_type, strike, settlement_price, oi, volume 
+        FROM eod_options_series 
+        WHERE trade_date = ? AND series = ?;
+        """
+        _, rows_o0 = execute_turso_sql(pipeline_url, auth_token, sql_opts, [t_0, front_series])
+        _, rows_oprev = execute_turso_sql(pipeline_url, auth_token, sql_opts, [t_minus_1, front_series])
+
+        prev_map = {}
+        for r in rows_oprev:
+            otype = str(r[0]).upper()
+            strike = float(r[1])
+            px = float(r[2]) if r[2] is not None else 0.0
+            oi = int(r[3] or 0)
+            prev_map[(otype, strike)] = {"px": px, "oi": oi}
+
+        call_candidates = []
+        put_candidates = []
+
+        for r in rows_o0:
+            otype = str(r[0]).upper()
+            strike = float(r[1])
+            px_0 = float(r[2]) if r[2] is not None else 0.0
+            oi_0 = int(r[3] or 0)
+
+            prev_info = prev_map.get((otype, strike), {"px": px_0, "oi": oi_0})
+            px_prev = prev_info["px"]
+            oi_prev = prev_info["oi"]
+            doi = oi_0 - oi_prev
+
+            # Calculate IV at T_0 and T_-1
+            iv_0 = calculate_implied_vol(px_0, futures_ref_t0, strike, T_front_t0, r_rf, otype)
+            iv_prev = calculate_implied_vol(px_prev, futures_ref_tprev, strike, T_front_tprev, r_rf, otype)
+
+            if not np.isnan(iv_0) and not np.isnan(iv_prev):
+                div = (iv_0 - iv_prev) * 100.0
+            else:
+                div = 0.0
+
+            item = {
+                "strike": strike,
+                "oi_0": oi_0,
+                "doi": doi,
+                "iv_0": iv_0,
+                "div": div
+            }
+
+            if otype == "C":
+                call_candidates.append(item)
+            elif otype == "P":
+                put_candidates.append(item)
+
+        # Top Call Strike
+        calls_pos = [c for c in call_candidates if c["doi"] > 0]
+        if calls_pos:
+            top_call = max(calls_pos, key=lambda x: x["doi"])
+        elif call_candidates:
+            top_call = max(call_candidates, key=lambda x: x["oi_0"])
+        else:
+            top_call = {"strike": futures_ref_t0, "doi": 0, "div": 0.0}
+
+        # Top Put Strike
+        puts_pos = [p for p in put_candidates if p["doi"] > 0]
+        if puts_pos:
+            top_put = max(puts_pos, key=lambda x: x["doi"])
+        elif put_candidates:
+            top_put = max(put_candidates, key=lambda x: x["oi_0"])
+        else:
+            top_put = {"strike": futures_ref_t0, "doi": 0, "div": 0.0}
+
+        # Institutional Intent Interpretation
+        if top_call["doi"] > 0:
+            if top_call["div"] > 0.5:
+                call_intent = "Aggressive Call Buying (เก็งกำไรขาขึ้นทะลุต้าน)"
+            elif top_call["div"] <= 0.0:
+                call_intent = "Call Writing / Cap Resistance (ล็อกแนวต้าน / เก็บพรีเมียม)"
+            else:
+                call_intent = "Call Accumulation (สะสมสัญญา Call)"
+        else:
+            call_intent = "Call Liquidation / Neutral (ปิดสัญญา / ทรงตัว)"
+
+        if top_put["doi"] > 0:
+            if top_put["div"] > 0.5:
+                put_intent = "Aggressive Put Buying / Downside Hedging (ประกันความเสี่ยงขาลงอย่างเร่งด่วน)"
+            elif top_put["div"] <= 0.0:
+                put_intent = "Put Writing / Floor Support (ขาย Put ล็อกฐานแนวรับ)"
+            else:
+                put_intent = "Put Accumulation (สะสมสัญญา Put)"
+        else:
+            put_intent = "Put Liquidation / Neutral (ปิดสัญญา / ทรงตัว)"
+
+        return {
+            "foreign_call_net": f_call_net,
+            "foreign_put_net": f_put_net,
+            "top_call_strike": float(top_call["strike"]),
+            "top_call_doi": int(top_call["doi"]),
+            "top_call_div": float(top_call["div"]),
+            "call_intent": call_intent,
+            "top_put_strike": float(top_put["strike"]),
+            "top_put_doi": int(top_put["doi"]),
+            "top_put_div": float(top_put["div"]),
+            "put_intent": put_intent
+        }
+    except Exception as e:
+        print(f"[OPTIONS_FOOTPRINT] Warning: analyze_options_footprint failed: {e}")
+        return {
+            "foreign_call_net": 0,
+            "foreign_put_net": 0,
+            "top_call_strike": futures_ref_t0,
+            "top_call_doi": 0,
+            "top_call_div": 0.0,
+            "call_intent": "N/A",
+            "top_put_strike": futures_ref_t0,
+            "top_put_doi": 0,
+            "top_put_div": 0.0,
+            "put_intent": "N/A"
+        }
+
+# ==============================================================================
 # RULE-BASED THAI TRADING PLAYBOOK GENERATOR
 # ==============================================================================
 
@@ -406,15 +740,17 @@ def generate_thai_trading_playbook(
     inst_net: int,
     local_net: int,
     flow_regime: str,
-    flow_emoji: str
+    flow_emoji: str,
+    foreign_footprint: dict = None,
+    options_footprint: dict = None
 ) -> str:
     """
     Constructs an actionable, rule-based frontline trading plan in Thai.
     4 Core Pillars:
     1. 1-Day Expected Move (1-SD)
     2. Tactical Key Levels (Ranked nearest to current price)
-    3. Smart Money Flow Breakdown
-    4. Daily Action Plan & Stop Loss
+    3. Smart Money Flow & Footprint Breakdown
+    4. Daily Action Plan & Institutional Defense Level
     """
     res_1 = tactical_levels["res_1"]
     res_1_oi = tactical_levels["res_1_oi"]
@@ -433,6 +769,8 @@ def generate_thai_trading_playbook(
     else:
         iv_desc = "ความผันผวนสูง แกว่งกว้าง ควรกระชับจุดคัต"
 
+    f_cost = foreign_footprint.get("cost_basis", futures_ref) if foreign_footprint else futures_ref
+
     # 2. Smart Money Translation & Actionable Playbook Logic
     if foreign_net > 0 and delta_oi > 0:
         flow_title = "New Long Build-up (ต่างชาติเปิดสะสม Long สัญญาใหม่)"
@@ -441,7 +779,7 @@ def generate_thai_trading_playbook(
         action_strategy = "Follow-Through ฝั่ง Long ตามโมเมนตัม ไม่ดักสวนเทรนด์"
         long_plan = f"รอจังหวะย่อตัวแถว รับ 1 (<code>{sup_1:.0f}</code>) หรือราคาเปิด หากยืนได้เปิด Long เป้าหมาย <code>{res_1:.0f}</code> และ <code>{upper_1sd:.1f}</code>"
         short_plan = f"ชะลอการ Short จนกว่าจะขึ้นทดสอบ ต้าน 2 (<code>{res_2:.0f}</code>) หรือ Upper 1-SD แล้วเกิดสัญญาณ Rejection ไม่ผ่าน"
-        stop_loss_plan = f"ฝั่ง Long วาง Stop Loss เมื่อราคาหลุด <code>{sup_2:.0f}</code> จุด"
+        stop_loss_plan = f"ฝั่ง Long วาง Stop Loss เมื่อราคาหลุด <code>{min(sup_2, f_cost):.0f}</code> จุด (แนว Defense ฝรั่ง)"
     elif foreign_net > 0 and delta_oi < 0:
         flow_title = "Short Covering (ต่างชาติปิดทำกำไร/ลดพอร์ต Short)"
         flow_detail = f"ต่างชาติซื้อสุทธิ <code>{foreign_net:+,}</code> สัญญา แต่ OI หดตัว <code>{delta_oi:+,}</code> สัญญา เป็นแรงซื้อคืนเพื่อปิดสัญญา Short เดิม"
@@ -457,7 +795,7 @@ def generate_thai_trading_playbook(
         action_strategy = "เน้นฝั่ง Short (Trend Expansion Down) ตามน้ำ ระวังการหลุดแนวรับแล้วรูดแรง"
         long_plan = f"หลีกเลี่ยงการดักสวนรับเร็ว (มีดตก) จนกว่าราคาจะลงแตะ รับ 2 (<code>{sup_2:.0f}</code>) หรือ Lower 1-SD แล้วเกิดสัญญาณหยุดลง"
         short_plan = f"เด้งขึ้นทดสอบ ต้าน 1 (<code>{res_1:.0f}</code>) หรือ Max Pain (<code>{max_pain:.0f}</code>) ไม่ผ่าน เปิด Short เป้าหมาย <code>{sup_1:.0f}</code> และ <code>{lower_1sd:.1f}</code>"
-        stop_loss_plan = f"ฝั่ง Short วาง Stop Loss เหนือ <code>{res_1 + 2.5:.1f}</code> จุด"
+        stop_loss_plan = f"ฝั่ง Short วาง Stop Loss เหนือ <code>{max(res_1 + 2.5, f_cost):.1f}</code> จุด"
     elif foreign_net < 0 and delta_oi < 0:
         flow_title = "Long Liquidation (ต่างชาติปิดทำกำไร/ลดพอร์ต Long)"
         flow_detail = f"ต่างชาติขายสุทธิ <code>{foreign_net:+,}</code> สัญญา ควบคู่กับ OI ลดลง <code>{delta_oi:+,}</code> สัญญา เป็นการปิดสัญญาลดความเสี่ยง"
@@ -478,6 +816,52 @@ def generate_thai_trading_playbook(
     gamma_flip_str = f"{gamma_flip_val:.1f}" if not math.isnan(gamma_flip_val) else "N/A"
     gamma_emoji = "🛡️" if is_positive_gamma else "⚡"
 
+    # Format Foreign Footprint
+    if foreign_footprint:
+        f_cum = foreign_footprint.get("cum_foreign_net", 0)
+        f_pnl_status = foreign_footprint.get("pnl_status", "N/A")
+        f_z_desc = foreign_footprint.get("z_desc", "N/A")
+        f_div_text = foreign_footprint.get("divergence_text", "N/A")
+        f_days = foreign_footprint.get("history_days", 60)
+        foreign_footprint_block = f"""• <b>สถิติแกะรอยต่างชาติสะสม ({f_days} วันทำการ):</b>
+  - ยอดสะสมสุทธิ: <code>{f_cum:+,}</code> สัญญา | ต้นทุนเฉลี่ย: <code>{f_cost:.1f}</code> จุด <i>({f_pnl_status})</i>
+  - สถิติ Flow Z-Score (20 วัน): {f_z_desc}
+  - สัญญาณขัดแย้งราคา (5 วัน): {f_div_text}"""
+    else:
+        foreign_footprint_block = ""
+
+    # Format Options Footprint
+    if options_footprint:
+        o_c_net = options_footprint.get("foreign_call_net", 0)
+        o_p_net = options_footprint.get("foreign_put_net", 0)
+        top_c_k = options_footprint.get("top_call_strike", res_1)
+        top_c_doi = options_footprint.get("top_call_doi", 0)
+        top_c_div = options_footprint.get("top_call_div", 0.0)
+        c_intent = options_footprint.get("call_intent", "N/A")
+        top_p_k = options_footprint.get("top_put_strike", sup_1)
+        top_p_doi = options_footprint.get("top_put_doi", 0)
+        top_p_div = options_footprint.get("top_put_div", 0.0)
+        p_intent = options_footprint.get("put_intent", "N/A")
+
+        options_footprint_block = f"""• <b>Options Strike Footprint (พอร์ตต่างชาติ & Strike เด่น):</b>
+  - ยอดต่างชาติ Options: Call <code>{o_c_net:+,}</code> | Put <code>{o_p_net:+,}</code> สัญญา
+  - Call เด่น: Strike <code>{top_c_k:.0f}</code> (ΔOI: <code>{top_c_doi:+,}</code>, ΔIV: <code>{top_c_div:+.2f}%</code>) ➔ <i>{c_intent}</i>
+  - Put เด่น: Strike <code>{top_p_k:.0f}</code> (ΔOI: <code>{top_p_doi:+,}</code>, ΔIV: <code>{top_p_div:+.2f}%</code>) ➔ <i>{p_intent}</i>"""
+    else:
+        options_footprint_block = ""
+
+    # Format Institutional Cost Narrative for Action Plan
+    if foreign_footprint and f_cost > 0:
+        if futures_ref >= f_cost:
+            cost_relation = f"ราคาปัจจุบัน ({futures_ref:.1f}) ยืนเหนือต้นทุนเฉลี่ยสะสมฝรั่ง ({f_cost:.1f}) ซึ่งทำหน้าที่เป็นแนวรับเชิงจิตวิทยา/Defense Level สำคัญ"
+        else:
+            cost_relation = f"ราคาปัจจุบัน ({futures_ref:.1f}) อยู่ต่ำกว่าต้นทุนเฉลี่ยสะสมฝรั่ง ({f_cost:.1f}) ต่างชาติติดดอย อาจมีแรงขายลดความเสี่ยงเมื่อราคาเด้งทดสอบ {f_cost:.1f}"
+        cost_narrative = f"""• <b>แนวปะทะต้นทุนสถาบัน (Institutional Cost Line):</b> <code>{f_cost:.1f}</code> จุด
+  <i>({cost_relation})</i>
+"""
+    else:
+        cost_narrative = ""
+
     msg = f"""🎯 <b>แผนการเทรด SET50 ประจำวัน | TFEX QUANT RADAR</b>
 📅 <i>ข้อมูลสิ้นวัน {trade_date} | ออกรายงานเช้า {as_of_time_bkk} น.</i>
 ━━━━━━━━━━━━━━━━━━━━━━
@@ -497,18 +881,20 @@ def generate_thai_trading_playbook(
 ───────────────
 🏛️ <i>กรอบใหญ่ไตรมาส: Put Wall <code>{put_wall:.0f}</code> – Call Wall <code>{call_wall:.0f}</code> | Gamma Flip: <code>{gamma_flip_str}</code></i>
 
-🌊 <b>3. พฤติกรรมรายใหญ่ (Smart Money Flow)</b>
+🌊 <b>3. พฤติกรรมรายใหญ่ (Smart Money Flow & Footprint)</b>
 • <b>สถานะ Flow:</b> {flow_emoji} <b>{flow_title}</b>
 • <b>การวิเคราะห์:</b> {flow_detail}
 • <b>ข้อควรระวัง:</b> {flow_caution}
-• <b>ยอดซื้อขายสุทธิรายกลุ่ม:</b>
+• <b>ยอดซื้อขายสุทธิรายกลุ่ม (วันล่าสุด):</b>
   - ต่างชาติ (Foreign): <code>{foreign_net:+,}</code> สัญญา (ΔOI: <code>{delta_oi:+,}</code>)
   - กองทุน (Institution): <code>{inst_net:+,}</code> | รายย่อย (Local): <code>{local_net:+,}</code>
+{foreign_footprint_block}
+{options_footprint_block}
 
 ⚔️ <b>4. กลยุทธ์และแผนการเล่นวันนี้ (Daily Action Plan)</b>
 • <b>สภาวะตลาด (Dealer Gamma):</b> {gamma_emoji} <b>{gamma_zone_title}</b>
   <i>({gamma_desc})</i>
-• <b>แผนการปฏิบัติหน้างาน:</b>
+{cost_narrative}• <b>แผนการปฏิบัติหน้างาน:</b>
   💡 <b>กลยุทธ์หลัก:</b> {action_strategy}
   🟢 <b>ฝั่ง Long:</b> {long_plan}
   🔴 <b>ฝั่ง Short:</b> {short_plan}
@@ -798,8 +1184,8 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
-    # If test mode is requested without Turso DB credentials, execute with realistic mock data
-    if test_mode and (not turso_url or not turso_token):
+    # If test mode is requested, execute with realistic mock data
+    if test_mode:
         print("[TEST] Running with mock SET50 quant dataset to verify Thai trading plan formatting...")
         t_0 = (datetime.datetime.now(BKK_TZ) - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
         futures_ref = 918.5
@@ -841,6 +1227,31 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         local_net = -2300
         flow_regime, flow_emoji, flow_desc = decompose_smart_money(foreign_net, delta_oi)
 
+        # Mock Footprint Analytics for Phase 1
+        mock_foreign_footprint = {
+            "cum_foreign_net": 18450,
+            "cost_basis": 914.8,
+            "pnl_pts": 3.7,
+            "pnl_status": "กำไร (+3.7 จุด)",
+            "z_score": 1.68,
+            "z_desc": "🚨 ผิดปกติอย่างมีนัยสำคัญ (ซื้อหนักผิดปกติ Outlier: Z = +1.68 SD)",
+            "is_outlier": True,
+            "divergence_text": "สอดคล้องกับทิศทางราคา (Confluent Direction)",
+            "history_days": 60
+        }
+        mock_options_footprint = {
+            "foreign_call_net": 3250,
+            "foreign_put_net": -1420,
+            "top_call_strike": 930.0,
+            "top_call_doi": 1850,
+            "top_call_div": 0.85,
+            "call_intent": "Aggressive Call Buying (เก็งกำไรขาขึ้นทะลุต้าน)",
+            "top_put_strike": 900.0,
+            "top_put_doi": 2400,
+            "top_put_div": -0.35,
+            "put_intent": "Put Writing / Floor Support (ขาย Put ล็อกฐานแนวรับ)"
+        }
+
         html_file = build_interactive_dashboard(
             trade_date=t_0, futures_ref=futures_ref, front_series=front_series, next_series=next_series,
             res_df=res_df, gamma_flip_cum=gamma_flip_val, call_wall=call_wall, put_wall=put_wall,
@@ -857,7 +1268,9 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
             gamma_flip_val=gamma_flip_val, is_positive_gamma=is_positive_gamma,
             gamma_zone_title=gamma_zone_title, gamma_desc=gamma_desc, total_net_gex=total_net_gex,
             foreign_net=foreign_net, delta_oi=delta_oi, inst_net=inst_net, local_net=local_net,
-            flow_regime=flow_regime, flow_emoji=flow_emoji
+            flow_regime=flow_regime, flow_emoji=flow_emoji,
+            foreign_footprint=mock_foreign_footprint,
+            options_footprint=mock_options_footprint
         )
 
         print("\n" + "=" * 75)
@@ -1171,6 +1584,48 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
     print(f"[FLOW] Total Futures OI : {tot_oi_0:,} (Change: {delta_oi:+,} contracts)")
     print(f"[FLOW] Smart Money State: {flow_emoji} {flow_regime} ({flow_desc})")
 
+    # 7.1 Deep Footprint Analytics (Foreign Cost Basis & Options Strike Footprint)
+    # Fetch T_-1 settlement for front_series
+    _, rows_f_prev = execute_turso_sql(
+        pipeline_url, turso_token,
+        "SELECT settlement_price FROM eod_futures_series WHERE trade_date = ? AND series = ?;",
+        [t_minus_1, front_series]
+    )
+    futures_ref_tprev = float(rows_f_prev[0][0]) if rows_f_prev and rows_f_prev[0][0] is not None else futures_ref
+    t_minus_1_dt = datetime.datetime.strptime(t_minus_1, "%Y-%m-%d").date()
+    days_to_exp_tprev = max(0.5, (expiry_front - t_minus_1_dt).days)
+    T_front_tprev = days_to_exp_tprev / 365.0
+
+    print("[FOOTPRINT] Analyzing Foreign 60-day cumulative flow and inventory cost basis...")
+    foreign_footprint = analyze_foreign_footprint(
+        pipeline_url=pipeline_url,
+        auth_token=turso_token,
+        target_date=t_0,
+        front_series=front_series,
+        futures_ref=futures_ref,
+        lookback_days=60
+    )
+    print(f"[FOOTPRINT] Foreign 60D Cum Net: {foreign_footprint['cum_foreign_net']:+,} contracts | Cost Basis: {foreign_footprint['cost_basis']:.1f} ({foreign_footprint['pnl_status']})")
+    print(f"[FOOTPRINT] Foreign Flow Z-Score: {foreign_footprint['z_score']:+.2f} ({foreign_footprint['z_desc']})")
+    print(f"[FOOTPRINT] Price-Flow Divergence: {foreign_footprint['divergence_text']}")
+
+    print("[FOOTPRINT] Analyzing Options Strike Footprint (ΔOI & ΔIV)...")
+    options_footprint = analyze_options_footprint(
+        pipeline_url=pipeline_url,
+        auth_token=turso_token,
+        t_0=t_0,
+        t_minus_1=t_minus_1,
+        front_series=front_series,
+        futures_ref_t0=futures_ref,
+        futures_ref_tprev=futures_ref_tprev,
+        T_front_t0=T_front,
+        T_front_tprev=T_front_tprev,
+        r_rf=r_rf
+    )
+    print(f"[FOOTPRINT] Options Foreign Net: Call {options_footprint['foreign_call_net']:+,} | Put {options_footprint['foreign_put_net']:+,}")
+    print(f"[FOOTPRINT] Top Call Expansion: Strike {options_footprint['top_call_strike']:.0f} (ΔOI: {options_footprint['top_call_doi']:+,}, ΔIV: {options_footprint['top_call_div']:+.2f}%) -> {options_footprint['call_intent']}")
+    print(f"[FOOTPRINT] Top Put Expansion : Strike {options_footprint['top_put_strike']:.0f} (ΔOI: {options_footprint['top_put_doi']:+,}, ΔIV: {options_footprint['top_put_div']:+.2f}%) -> {options_footprint['put_intent']}")
+
     # 8. Interactive HTML Dashboard Generation
     html_file = build_interactive_dashboard(
         trade_date=t_0,
@@ -1217,7 +1672,9 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         inst_net=inst_net,
         local_net=local_net,
         flow_regime=flow_regime,
-        flow_emoji=flow_emoji
+        flow_emoji=flow_emoji,
+        foreign_footprint=foreign_footprint,
+        options_footprint=options_footprint
     )
 
     # 10. Persist Log to Turso Database

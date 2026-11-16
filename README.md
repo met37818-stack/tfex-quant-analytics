@@ -43,23 +43,31 @@
   * 🟢 **รับ 2:** Strike ที่มี Put OI หนาแน่นรองรับ
 * ระบุกรอบใหญ่ไตรมาส (**Put Wall – Call Wall** และ **Gamma Flip**) ไว้ด้านล่าง
 
-### 3. 🌊 พฤติกรรมรายใหญ่ (Smart Money Flow)
-* แปลงผลการเคลื่อนไหวของนักลงทุนต่างชาติ (**Foreign Net Flow**) เทียบกับอัตราการเปลี่ยนแปลงของสถานะคงค้างรวม (**$\Delta$OI**):
-  * 🟢 **New Long Build-up:** ต่างชาติซื้อสุทธิ + OI เพิ่มขึ้น (สะสมพลังขาขึ้นแท้จริง)
-  * 🟡 **Short Covering:** ต่างชาติซื้อสุทธิ + OI ลดลง (ปิดสัญญา Short เก่า ระวัง Technical Rebound สั้น)
-  * 🔴 **New Short Build-up:** ต่างชาติขายสุทธิ + OI เพิ่มขึ้น (เปิด Short ใหม่ กดดันขาลง)
-  * 🟠 **Long Liquidation:** ต่างชาติขายสุทธิ + OI ลดลง (ปิดทำกำไร/ลดพอร์ต Long)
-* สรุปยอดซื้อขายสุทธิครบทุกกลุ่ม: Foreign, Institutional, Local Retail
+### 3. 🌊 พฤติกรรมรายใหญ่ (Smart Money Flow & Footprint)
+* **การเคลื่อนไหวรายวัน (Intraday Smart Money Flow):**
+  * แปลงผลนักลงทุนต่างชาติ (**Foreign Net Flow**) เทียบกับอัตราการเปลี่ยนแปลงของสถานะคงค้างรวม (**$\Delta$OI**):
+    * 🟢 **New Long Build-up:** ต่างชาติซื้อสุทธิ + OI เพิ่มขึ้น (สะสมพลังขาขึ้นแท้จริง)
+    * 🟡 **Short Covering:** ต่างชาติซื้อสุทธิ + OI ลดลง (ปิดสัญญา Short เก่า ระวัง Technical Rebound สั้น)
+    * 🔴 **New Short Build-up:** ต่างชาติขายสุทธิ + OI เพิ่มขึ้น (เปิด Short ใหม่ กดดันขาลง)
+    * 🟠 **Long Liquidation:** ต่างชาติขายสุทธิ + OI ลดลง (ปิดทำกำไร/ลดพอร์ต Long)
+  * สรุปยอดซื้อขายสุทธิครบทุกกลุ่ม: Foreign, Institutional, Local Retail
+* **แกะรอยพอร์ตสะสมและต้นทุนฝรั่ง (Foreign Cumulative Footprint 60 วัน):**
+  * **ยอดสะสมสุทธิ & ต้นทุนเฉลี่ยสะสม (Foreign Cost Basis):** คำนวณแบบ Running Inventory ถ่วงน้ำหนักยอดซื้อขายจริงกับราคา Settlement เพื่อหาต้นทุนเฉลี่ยที่แท้จริง พร้อมประเมินสถานะ กำไร/ขาดทุน
+  * **20-Day Flow Z-Score:** แปลงยอดซื้อขายล่าสุดเป็นค่าความเบี่ยงเบนมาตรฐาน (Z-Score) หาก $|Z| \ge 1.5$ จะแจ้งเตือนยอดซื้อ/ขายผิดปกติอย่างมีนัยสำคัญ
+  * **Price-Flow Divergence (5 วัน):** ตรวจจับสัญญาณขัดแย้ง เช่น ราคาขึ้นแต่ฝรั่งเทขาย (Bearish Divergence) หรือราคาย่อแต่ฝรั่งดักช้อน (Bullish Divergence)
+* **Options Strike Footprint (จับคู่ต่างชาติ & การขยายตัว Strike):**
+  * ตรวจจับยอด Options สุทธิของกลุ่มต่างชาติ (Call/Put)
+  * คัดกรอง Strike ที่มี $\Delta$OI สูงสุด พร้อมทิศทาง $\Delta$IV เพื่อระบุเจตนาสถาบัน (Aggressive Buying, Writing / Strike Cap, Downside Hedging, Floor Support)
 
 ### 4. ⚔️ กลยุทธ์และแผนการเล่นวันนี้ (Daily Action Plan)
-* **Gamma Flip & Net GEX Consistency:**
-  * หาก $S50 \ge \text{Gamma Flip}$: อยู่ในโซน **Positive Gamma** (ดีลเลอร์ช่วยซับแรงกระแทก ตลาดมักแกว่งในกรอบ Mean Reversion)
-  * หาก $S50 < \text{Gamma Flip}$: อยู่ในโซน **Negative Gamma** (ดีลเลอร์เทรดตามโมเมนตัมเร่งแรงแกว่งตัว ระวังหลุดแนวรับแล้วรูดแรง Trend Expansion)
+* **สภาวะตลาด (Dealer Gamma & Institutional Cost Line):**
+  * **Gamma Flip & Net GEX Regime:** ระบุสภาวะตลาดระหว่าง Positive Gamma (ลดความผันผวน / Mean Reversion) และ Negative Gamma (เร่งความผันผวน / Trend Expansion)
+  * **Institutional Defense Line:** วิเคราะห์ความสัมพันธ์ของราคาปัจจุบันกับต้นทุนเฉลี่ยสะสมฝรั่ง เพื่อใช้เป็นแนวรับ/แนวต้านจิตวิทยา
 * **แผนปฏิบัติการหน้างาน:**
-  * กลยุทธ์หลัก
-  * แผนฝั่ง Long (จุดเข้า, เงื่อนไข, เป้าหมายกำไร)
-  * แผนฝั่ง Short (จุดเข้า, เงื่อนไข, เป้าหมายกำไร)
-  * จุดตัดขาดทุน (Stop Loss) อัตโนมัติ
+  * กลยุทธ์หลักประจำวัน
+  * แผนฝั่ง Long (จุดตั้งรับ, เงื่อนไขยืนยัน, เป้าทำกำไร)
+  * แผนฝั่ง Short (จุดดัก Short, เงื่อนไขยืนยัน, เป้าทำกำไร)
+  * จุดตัดขาดทุน (Stop Loss) อัตโนมัติ ผสานแนวรับ-ต้าน Tactical และ Institutional Defense Level
 
 ---
 
