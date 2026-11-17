@@ -449,7 +449,7 @@ def analyze_foreign_footprint(
             dt = r[0]
             f_net = int(r[1] or 0)
             px = px_dict.get(dt, futures_ref)
-            records.append({"date": dt, "foreign_net": f_net, "settlement_price": px})
+            records.append({"date": dt, "trade_date": dt, "foreign_net": f_net, "settlement_price": px})
 
         if not records:
             return {
@@ -1135,6 +1135,7 @@ def fetch_volatility_time_series(
     for dt in all_dates:
         vol_series.append({
             "date": dt,
+            "trade_date": dt,
             "atm_iv": iv_map.get(dt),
             "rv_annualized": rv_map.get(dt)
         })
@@ -1468,10 +1469,10 @@ def build_interactive_dashboard(
     # ----------------------------------------------------
     f_series = foreign_footprint.get("series_data", []) if foreign_footprint else []
     if f_series:
-        f_dates = [r["trade_date"] for r in f_series]
-        f_px = [float(r["settlement_price"]) for r in f_series]
-        f_cost = [float(r.get("cost_basis", r["settlement_price"])) for r in f_series]
-        f_net = [int(r["foreign_net"]) for r in f_series]
+        f_dates = [r.get("trade_date") or r.get("date") for r in f_series]
+        f_px = [float(r.get("settlement_price", futures_ref)) for r in f_series]
+        f_cost = [float(r.get("cost_basis", r.get("settlement_price", futures_ref))) for r in f_series]
+        f_net = [int(r.get("foreign_net", 0)) for r in f_series]
     else:
         f_dates = [trade_date]
         f_px = [futures_ref]
@@ -1513,7 +1514,7 @@ def build_interactive_dashboard(
     # Subplot 2: Volatility Regime Time-Series
     # ----------------------------------------------------
     if vol_time_series:
-        v_dates = [v["date"] for v in vol_time_series]
+        v_dates = [v.get("trade_date") or v.get("date") for v in vol_time_series]
         v_iv = [v["atm_iv"] * 100.0 if v.get("atm_iv") is not None else None for v in vol_time_series]
         v_rv = [v["rv_annualized"] * 100.0 if v.get("rv_annualized") is not None else None for v in vol_time_series]
 
