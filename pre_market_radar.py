@@ -472,6 +472,8 @@ def analyze_foreign_footprint(
             net_i = rec["foreign_net"]
             px_i = rec["settlement_price"]
             if net_i == 0:
+                rec["cost_basis"] = float(cost_basis)
+                rec["cum_net"] = int(cum_net)
                 continue
 
             if cum_net == 0:
@@ -495,6 +497,9 @@ def analyze_foreign_footprint(
                     # Position flipped to opposite side
                     cum_net += net_i
                     cost_basis = px_i
+
+            rec["cost_basis"] = float(cost_basis)
+            rec["cum_net"] = int(cum_net)
 
         if cum_net == 0:
             cost_basis = futures_ref
@@ -554,7 +559,8 @@ def analyze_foreign_footprint(
             "z_desc": z_desc,
             "is_outlier": is_outlier,
             "divergence_text": divergence_text,
-            "history_days": len(records)
+            "history_days": len(records),
+            "series_data": records
         }
     except Exception as e:
         print(f"[FOOTPRINT] Warning: analyze_foreign_footprint failed: {e}")
@@ -567,7 +573,8 @@ def analyze_foreign_footprint(
             "z_desc": "เกิดข้อผิดพลาดในการดึงข้อมูล",
             "is_outlier": False,
             "divergence_text": "N/A",
-            "history_days": 0
+            "history_days": 0,
+            "series_data": []
         }
 
 def analyze_options_footprint(
@@ -767,6 +774,7 @@ def compute_intraday_rv(
                 prices = [float(r[1]) for r in rows_spot if r[1] is not None]
 
         bar_count = len(prices)
+        is_valid_rv = (bar_count >= 280)
         if bar_count >= 5:
             log_returns = [
                 math.log(prices[i] / prices[i - 1]) 
@@ -788,8 +796,8 @@ def compute_intraday_rv(
 
         # 3. Compare RV vs ATM IV
         spread = (atm_iv - rv_annualized) * 100.0
-        if bar_count < 10:
-            vol_regime_desc = "ข้อมูล Intraday กำลังสะสม (ใช้ค่า ATM IV อ้างอิง)"
+        if not is_valid_rv:
+            vol_regime_desc = f"ข้อมูล Intraday วันล่าสุดไม่เต็มวัน (มี {bar_count}/325 บาร์) — งดคำนวณค่า RV เพื่อป้องกันตัวเลขคลาดเคลื่อน"
         elif atm_iv > rv_annualized + 0.02:
             vol_regime_desc = f"IV Premium สูง (Options แพงกว่าแกว่งจริง +{spread:.1f}% เหมาะเทรดในกรอบ)"
         elif rv_annualized >= atm_iv:
@@ -800,6 +808,7 @@ def compute_intraday_rv(
         return {
             "rv_annualized": float(rv_annualized),
             "bar_count": bar_count,
+            "is_valid_rv": is_valid_rv,
             "iv_rv_spread": float(spread),
             "vol_regime_desc": vol_regime_desc
         }
@@ -808,8 +817,9 @@ def compute_intraday_rv(
         return {
             "rv_annualized": float(atm_iv),
             "bar_count": 0,
+            "is_valid_rv": False,
             "iv_rv_spread": 0.0,
-            "vol_regime_desc": "ข้อมูล Intraday ไม่เพียงพอ (ใช้ค่า ATM IV อ้างอิง)"
+            "vol_regime_desc": "ข้อมูล Intraday ไม่เพียงพอ (มี 0/325 บาร์)"
         }
 
 def compute_volume_profile(
@@ -829,27 +839,30 @@ def compute_volume_profile(
     Cross-checks POC/VAH/VAL with Options Walls and Max Pain for Confluence Zones.
     """
     try:
-        # 1. Fetch available trade dates in futures_snapshots (up to lookback_days)
-        sql_dates = """
-        SELECT DISTINCT SUBSTR(captured_at_bkk, 1, 10) as dt 
+        # 1. Fetch available trade dates and bar counts in futures_snapshots (up to lookback_days)
+        sql_counts = """
+        SELECT SUBSTR(captured_at_bkk, 1, 10) as dt, COUNT(*) as cnt 
         FROM futures_snapshots 
         WHERE captured_at_bkk <= ? AND symbol = ?
+        GROUP BY dt
         ORDER BY dt DESC 
         LIMIT ?;
         """
-        _, rows_dates = execute_turso_sql(pipeline_url, auth_token, sql_dates, [f"{target_date} 23:59:59", front_series, lookback_days])
-        warmup_days = len(rows_dates)
+        _, rows_counts = execute_turso_sql(pipeline_url, auth_token, sql_counts, [f"{target_date} 23:59:59", front_series, lookback_days])
 
-        if warmup_days == 0:
-            sql_dates_all = """
-            SELECT DISTINCT SUBSTR(captured_at_bkk, 1, 10) as dt 
+        if not rows_counts:
+            sql_counts_all = """
+            SELECT SUBSTR(captured_at_bkk, 1, 10) as dt, COUNT(*) as cnt 
             FROM futures_snapshots 
             WHERE captured_at_bkk <= ? 
+            GROUP BY dt
             ORDER BY dt DESC 
             LIMIT ?;
             """
-            _, rows_dates = execute_turso_sql(pipeline_url, auth_token, sql_dates_all, [f"{target_date} 23:59:59", lookback_days])
-            warmup_days = len(rows_dates)
+            _, rows_counts = execute_turso_sql(pipeline_url, auth_token, sql_counts_all, [f"{target_date} 23:59:59", lookback_days])
+
+        warmup_days = len(rows_counts)
+        valid_days = len([r for r in rows_counts if int(r[1] or 0) >= 280])
 
         if warmup_days == 0:
             return {
@@ -857,11 +870,13 @@ def compute_volume_profile(
                 "vah": max_pain + 5.0,
                 "val": max_pain - 5.0,
                 "warmup_days": 0,
+                "valid_days": 0,
                 "confluence_text": "กำลังสะสมข้อมูล Intraday (ยังไม่มีบาร์ในระบบ)"
             }
 
-        min_date = rows_dates[-1][0]
-        max_date = rows_dates[0][0]
+        sorted_counts = sorted(rows_counts, key=lambda x: x[0])
+        min_date = sorted_counts[0][0]
+        max_date = sorted_counts[-1][0]
 
         # 2. Fetch 1-minute records across these dates
         sql_bars = """
@@ -973,6 +988,7 @@ def compute_volume_profile(
             "vah": float(vah),
             "val": float(val),
             "warmup_days": warmup_days,
+            "valid_days": valid_days,
             "confluence_text": confluence_text
         }
     except Exception as e:
@@ -982,6 +998,7 @@ def compute_volume_profile(
             "vah": max_pain + 5.0,
             "val": max_pain - 5.0,
             "warmup_days": 0,
+            "valid_days": 0,
             "confluence_text": "ข้อมูล Volume Profile ไม่เพียงพอ"
         }
 
@@ -1062,6 +1079,66 @@ def analyze_late_session_flow(
             "late_basis_delta": 0.0,
             "late_session_desc": "⚪ ไม่สามารถดึงข้อมูลช่วงท้ายตลาดได้"
         }
+
+def fetch_volatility_time_series(
+    pipeline_url: str,
+    auth_token: str,
+    current_date: str,
+    current_atm_iv: float,
+    current_rv: float,
+    is_valid_rv: bool,
+    lookback_days: int = 60
+) -> list[dict]:
+    """
+    Fetches historical ATM IV (from analytics_premarket_log) and valid Daily RV (bar_count >= 280 from daily_realized_vol).
+    Merges with current session's data for the Volatility Regime Time-Series chart.
+    """
+    iv_map = {}
+    rv_map = {}
+    try:
+        sql_log = """
+        SELECT trade_date, atm_iv 
+        FROM analytics_premarket_log 
+        WHERE trade_date <= ? 
+        ORDER BY trade_date ASC 
+        LIMIT ?;
+        """
+        _, rows_log = execute_turso_sql(pipeline_url, auth_token, sql_log, [current_date, lookback_days])
+        for r in rows_log:
+            if r[0] and r[1] is not None:
+                iv_map[str(r[0])] = float(r[1])
+    except Exception as e:
+        print(f"[VOL_SERIES] Note: fetch analytics_premarket_log: {e}")
+
+    try:
+        sql_rv = """
+        SELECT trade_date, rv_annualized, bar_count 
+        FROM daily_realized_vol 
+        WHERE bar_count >= 280 AND trade_date <= ? 
+        ORDER BY trade_date ASC 
+        LIMIT ?;
+        """
+        _, rows_rv = execute_turso_sql(pipeline_url, auth_token, sql_rv, [current_date, lookback_days])
+        for r in rows_rv:
+            if r[0] and r[1] is not None:
+                rv_map[str(r[0])] = float(r[1])
+    except Exception as e:
+        print(f"[VOL_SERIES] Note: fetch daily_realized_vol: {e}")
+
+    # Add or update current session
+    iv_map[current_date] = float(current_atm_iv)
+    if is_valid_rv and current_rv is not None:
+        rv_map[current_date] = float(current_rv)
+
+    all_dates = sorted(set(list(iv_map.keys()) + list(rv_map.keys())))
+    vol_series = []
+    for dt in all_dates:
+        vol_series.append({
+            "date": dt,
+            "atm_iv": iv_map.get(dt),
+            "rv_annualized": rv_map.get(dt)
+        })
+    return vol_series
 
 # ==============================================================================
 # RULE-BASED THAI TRADING PLAYBOOK GENERATOR
@@ -1168,18 +1245,31 @@ def generate_thai_trading_playbook(
         stop_loss_plan = f"คัตเมื่อหลุด <code>{sup_2:.0f}</code> หรือทะลุ <code>{res_2:.0f}</code>"
 
     gamma_flip_str = f"{gamma_flip_val:.1f}" if not math.isnan(gamma_flip_val) else "N/A"
-    gamma_emoji = "🛡️" if is_positive_gamma else "⚡"
+    if not math.isnan(gamma_flip_val) and abs(futures_ref - gamma_flip_val) <= 3.0:
+        gamma_emoji = "⚖️"
+        gamma_zone_title = "Neutral / Transitional Gamma (ใกล้จุดเปลี่ยนโซน)"
+        gamma_desc_compact = f"ราคาประชิด Gamma Flip ({gamma_flip_val:.1f}) เป็นจุดหมุนความผันผวน ตลาดอยู่ในช่วงเปลี่ยนผ่าน เหมาะเทรดในกรอบ (Mean Reversion)"
+    elif is_positive_gamma:
+        gamma_emoji = "🛡️"
+        gamma_zone_title = "Positive Gamma (โซนลดความผันผวน / Mean Reversion)"
+        gamma_desc_compact = f"ราคาเหนือ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Long Gamma ซับแรงเหวี่ยง ช่วยพยุงการแกว่งตัวในกรอบ (Mean Reversion)"
+    else:
+        gamma_emoji = "⚡"
+        gamma_zone_title = "Negative Gamma (โซนเร่งความผันผวน / Trend Expansion)"
+        gamma_desc_compact = f"ราคาใต้ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Short Gamma หลุดรับจะเร่งแรงขาย ระวังความผันผวนขยายตัว (Trend Expansion)"
 
     # Format Intraday & Realized Volatility Block
     if intraday_rv and volume_profile and late_session:
         rv_ann = intraday_rv.get("rv_annualized", atm_iv)
         bar_count = intraday_rv.get("bar_count", 0)
+        is_valid_rv = intraday_rv.get("is_valid_rv", bar_count >= 280)
         vol_regime_desc = intraday_rv.get("vol_regime_desc", "N/A")
 
         poc = volume_profile.get("poc", futures_ref)
         vah = volume_profile.get("vah", futures_ref + 5)
         val = volume_profile.get("val", futures_ref - 5)
         warmup_days = volume_profile.get("warmup_days", 0)
+        valid_days = volume_profile.get("valid_days", 0)
         confluence_text = volume_profile.get("confluence_text", "N/A")
 
         late_fut_delta = late_session.get("late_fut_delta", 0.0)
@@ -1187,12 +1277,21 @@ def generate_thai_trading_playbook(
         late_basis_delta = late_session.get("late_basis_delta", 0.0)
         late_session_desc = late_session.get("late_session_desc", "N/A")
 
-        intraday_block = f"""📊 <b>3. โครงสร้าง Intraday & ความผันผวน ({warmup_days}/20 วัน)</b>
-• <b>Realized vs Implied Vol:</b> RV <code>{rv_ann * 100:.2f}%</code> vs ATM IV <code>{atm_iv * 100:.2f}%</code> ({bar_count} บาร์)
-  └ <i>สภาวะ: {vol_regime_desc}</i>
+        if is_valid_rv:
+            rv_section_line = f"• <b>Realized vs Implied Vol:</b> RV <code>{rv_ann * 100:.2f}%</code> vs ATM IV <code>{atm_iv * 100:.2f}%</code> ({bar_count} บาร์)\n  └ <i>สภาวะ: {vol_regime_desc}</i>"
+        else:
+            rv_section_line = f"• <b>Realized Volatility (RV):</b> ⏳ <i>ข้อมูล Intraday วันล่าสุดไม่เต็มวัน (มี {bar_count}/325 บาร์) — งดคำนวณค่า RV เพื่อป้องกันตัวเลขคลาดเคลื่อน</i>"
+
+        if valid_days < 5:
+            profile_confluence_line = f"  - <i>⚠️ ข้อมูลสะสม {valid_days}/20 วัน (ยังไม่ครบ 5 วันทำการ — แสดงกรอบเบื้องต้นเท่านั้น ยังไม่ใช้อ้างอิงเป็นแนวรับ/ต้านคอนกรีต)</i>"
+        else:
+            profile_confluence_line = f"  - <b>Confluence Zone:</b> {confluence_text}"
+
+        intraday_block = f"""📊 <b>3. โครงสร้าง Intraday & ความผันผวน (Warm-up: {valid_days}/20 วัน)</b>
+{rv_section_line}
 • <b>Intraday Volume Profile:</b>
   - <b>POC:</b> <code>{poc:.0f}</code> จุด | <b>Value Area (70%):</b> <code>{val:.0f}</code> – <code>{vah:.0f}</code> จุด
-  - <b>Confluence Zone:</b> {confluence_text}
+{profile_confluence_line}
 • <b>ช่วงท้ายตลาด (16:30–16:55 น.):</b>
   - Futures: <code>{late_fut_delta:+.1f}</code> จุด | Basis ปิด: <code>{late_basis_close:+.2f}</code> (ΔBasis: <code>{late_basis_delta:+.2f}</code>)
   - <i>บทสรุป: {late_session_desc}</i>
@@ -1207,7 +1306,7 @@ def generate_thai_trading_playbook(
         f_z_desc = foreign_footprint.get("z_desc", "N/A")
         f_div_text = foreign_footprint.get("divergence_text", "N/A")
         f_days = foreign_footprint.get("history_days", 60)
-        foreign_footprint_block = f"""• <b>สถิติต่างชาติสะสม ({f_days} วัน):</b>
+        foreign_footprint_block = f"""• <b>สถิติต่างชาติสะสม ({f_days} วันทำการ):</b>
   - ยอดสะสม: <code>{f_cum:+,}</code> สัญญา | ต้นทุนเฉลี่ย: <code>{f_cost:.1f}</code> จุด <i>({f_pnl_status})</i>
   - Flow Z-Score (20D): {f_z_desc} | Divergence: {f_div_text}"""
     else:
@@ -1269,11 +1368,6 @@ def generate_thai_trading_playbook(
 """
     else:
         cost_narrative = ""
-
-    if is_positive_gamma:
-        gamma_desc_compact = f"ราคาเหนือ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Long Gamma ซับแรงเหวี่ยง ช่วยพยุงการแกว่งตัวในกรอบ (Mean Reversion)"
-    else:
-        gamma_desc_compact = f"ราคาใต้ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Short Gamma หลุดรับจะเร่งแรงขาย ระวังความผันผวนขยายตัว (Trend Expansion)"
 
     # Assemble Sections 3 and 4 cleanly
     sec4_lines = [
@@ -1341,25 +1435,122 @@ def build_interactive_dashboard(
     iv_df_next: pd.DataFrame,
     foreign_regime: str,
     upper_1sd: float = None,
-    lower_1sd: float = None
+    lower_1sd: float = None,
+    foreign_footprint: dict = None,
+    vol_time_series: list = None
 ) -> str:
     """
-    Generates a standalone, responsive, high-performance HTML report with 3 interactive subplots.
+    Generates a standalone, responsive, mobile-friendly HTML report with 5 interactive subplots.
     """
     fig = make_subplots(
-        rows=3, cols=1,
+        rows=5, cols=1,
         shared_xaxes=False,
-        vertical_spacing=0.10,
+        vertical_spacing=0.06,
+        specs=[
+            [{"secondary_y": True}],
+            [{"secondary_y": False}],
+            [{"secondary_y": False}],
+            [{"secondary_y": False}],
+            [{"secondary_y": False}],
+        ],
         subplot_titles=(
-            f"<b>1. Net Gamma Exposure (GEX) Profile by Strike — {front_series} (200 THB/pt)</b>",
-            f"<b>2. Implied Volatility Smile & Skew Curve — Front ({front_series}) vs Next ({next_series})</b>",
-            f"<b>3. Open Interest Distribution (Call vs Put) & Max Pain ({max_pain:.0f})</b>"
+            f"<b>1. Foreign Futures Flow & Running Cost Basis vs S50 Price ({front_series})</b>",
+            "<b>2. Volatility Regime (ATM IV vs Valid Daily Realized Volatility)</b>",
+            f"<b>3. Net Gamma Exposure (GEX) Profile by Strike — {front_series} (200 THB/pt)</b>",
+            f"<b>4. Implied Volatility Smile & Skew Curve — Front ({front_series}) vs Next ({next_series})</b>",
+            f"<b>5. Open Interest Distribution (Call vs Put) & Max Pain ({max_pain:.0f})</b>"
         ),
-        row_heights=[0.36, 0.32, 0.32]
+        row_heights=[0.23, 0.18, 0.21, 0.19, 0.19]
     )
 
     # ----------------------------------------------------
-    # Subplot 1: Net GEX Profile
+    # Subplot 1: Foreign Flow & Cost Basis vs S50 Price
+    # ----------------------------------------------------
+    f_series = foreign_footprint.get("series_data", []) if foreign_footprint else []
+    if f_series:
+        f_dates = [r["trade_date"] for r in f_series]
+        f_px = [float(r["settlement_price"]) for r in f_series]
+        f_cost = [float(r.get("cost_basis", r["settlement_price"])) for r in f_series]
+        f_net = [int(r["foreign_net"]) for r in f_series]
+    else:
+        f_dates = [trade_date]
+        f_px = [futures_ref]
+        f_cost = [foreign_footprint.get("cost_basis", futures_ref) if foreign_footprint else futures_ref]
+        f_net = [foreign_footprint.get("cum_foreign_net", 0) if foreign_footprint else 0]
+
+    f_bar_colors = ["#00E676" if x >= 0 else "#FF1744" for x in f_net]
+
+    fig.add_trace(
+        go.Scatter(
+            x=f_dates, y=f_px,
+            mode="lines+markers", name=f"{front_series} S50 Price",
+            line=dict(color="#00E5FF", width=2),
+            marker=dict(size=4),
+            hovertemplate="<b>%{x}</b><br>S50 Close: %{y:.1f} pts<extra></extra>"
+        ),
+        row=1, col=1, secondary_y=False
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=f_dates, y=f_cost,
+            mode="lines", name="Foreign Running Cost Basis",
+            line=dict(color="#FFD600", width=2, dash="dash"),
+            hovertemplate="<b>%{x}</b><br>Foreign Cost: %{y:.1f} pts<extra></extra>"
+        ),
+        row=1, col=1, secondary_y=False
+    )
+    fig.add_trace(
+        go.Bar(
+            x=f_dates, y=f_net,
+            name="Daily Foreign Net",
+            marker_color=f_bar_colors, opacity=0.4,
+            hovertemplate="<b>%{x}</b><br>Foreign Net: %{y:+,} contracts<extra></extra>"
+        ),
+        row=1, col=1, secondary_y=True
+    )
+
+    # ----------------------------------------------------
+    # Subplot 2: Volatility Regime Time-Series
+    # ----------------------------------------------------
+    if vol_time_series:
+        v_dates = [v["date"] for v in vol_time_series]
+        v_iv = [v["atm_iv"] * 100.0 if v.get("atm_iv") is not None else None for v in vol_time_series]
+        v_rv = [v["rv_annualized"] * 100.0 if v.get("rv_annualized") is not None else None for v in vol_time_series]
+
+        fig.add_trace(
+            go.Scatter(
+                x=v_dates, y=v_iv,
+                mode="lines+markers", name="ATM IV (%)",
+                line=dict(color="#BA68C8", width=2),
+                marker=dict(size=5),
+                connectgaps=True,
+                hovertemplate="<b>%{x}</b><br>ATM IV: %{y:.2f}%<extra></extra>"
+            ),
+            row=2, col=1
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=v_dates, y=v_rv,
+                mode="lines+markers", name="Daily RV (%) [≥280 bars]",
+                line=dict(color="#00E676", width=2),
+                marker=dict(size=6, symbol="diamond"),
+                connectgaps=False,
+                hovertemplate="<b>%{x}</b><br>Daily RV: %{y:.2f}%<extra></extra>"
+            ),
+            row=2, col=1
+        )
+    else:
+        fig.add_trace(
+            go.Scatter(
+                x=[trade_date], y=[0.0],
+                mode="markers", name="ATM IV (%)",
+                marker=dict(size=5, color="#BA68C8")
+            ),
+            row=2, col=1
+        )
+
+    # ----------------------------------------------------
+    # Subplot 3: Net GEX Profile
     # ----------------------------------------------------
     bar_colors = ["#00E676" if x >= 0 else "#FF1744" for x in res_df["net_gex_mb"]]
     fig.add_trace(
@@ -1370,16 +1561,16 @@ def build_interactive_dashboard(
             name="Net GEX (MB/pt)",
             hovertemplate="<b>Strike %{x}</b><br>Net GEX: %{y:.2f} MB/pt<extra></extra>"
         ),
-        row=1, col=1
+        row=3, col=1
     )
 
-    # Key Level Lines for Row 1
+    # Key Level Lines for Row 3
     # Futures Ref line
     fig.add_vline(
         x=futures_ref, line_width=2, line_dash="dash", line_color="#00E5FF",
         annotation_text=f"F: {futures_ref:.1f}", annotation_position="top left",
         annotation_font=dict(color="#00E5FF", size=11),
-        row=1, col=1
+        row=3, col=1
     )
     # Expected Move 1-SD Lines
     if upper_1sd is not None:
@@ -1387,14 +1578,14 @@ def build_interactive_dashboard(
             x=upper_1sd, line_width=1.5, line_dash="dot", line_color="#B388FF",
             annotation_text=f"Upper 1-SD: {upper_1sd:.1f}", annotation_position="top right",
             annotation_font=dict(color="#B388FF", size=9),
-            row=1, col=1
+            row=3, col=1
         )
     if lower_1sd is not None:
         fig.add_vline(
             x=lower_1sd, line_width=1.5, line_dash="dot", line_color="#B388FF",
             annotation_text=f"Lower 1-SD: {lower_1sd:.1f}", annotation_position="bottom left",
             annotation_font=dict(color="#B388FF", size=9),
-            row=1, col=1
+            row=3, col=1
         )
 
     # Gamma Flip Line
@@ -1403,25 +1594,25 @@ def build_interactive_dashboard(
             x=gamma_flip_cum, line_width=2.5, line_dash="dot", line_color="#FFD600",
             annotation_text=f"Flip: {gamma_flip_cum:.1f}", annotation_position="bottom right",
             annotation_font=dict(color="#FFD600", size=11),
-            row=1, col=1
+            row=3, col=1
         )
     # Call Wall
     fig.add_vline(
         x=call_wall, line_width=1.5, line_dash="dashdot", line_color="#69F0AE",
         annotation_text=f"Call Wall: {call_wall:.0f}", annotation_position="top right",
         annotation_font=dict(color="#69F0AE", size=10),
-        row=1, col=1
+        row=3, col=1
     )
     # Put Wall
     fig.add_vline(
         x=put_wall, line_width=1.5, line_dash="dashdot", line_color="#FF5252",
         annotation_text=f"Put Wall: {put_wall:.0f}", annotation_position="bottom left",
         annotation_font=dict(color="#FF5252", size=10),
-        row=1, col=1
+        row=3, col=1
     )
 
     # ----------------------------------------------------
-    # Subplot 2: IV Smile & Skew Curve
+    # Subplot 4: IV Smile & Skew Curve
     # ----------------------------------------------------
     if not iv_df_front.empty:
         c_front = iv_df_front[(iv_df_front["option_type"] == "C") & (iv_df_front["iv"].notnull())].sort_values("strike")
@@ -1434,7 +1625,7 @@ def build_interactive_dashboard(
                 marker=dict(size=5),
                 hovertemplate="<b>%{x} Call</b><br>IV: %{y:.2f}%<extra></extra>"
             ),
-            row=2, col=1
+            row=4, col=1
         )
         fig.add_trace(
             go.Scatter(
@@ -1444,7 +1635,7 @@ def build_interactive_dashboard(
                 marker=dict(size=5),
                 hovertemplate="<b>%{x} Put</b><br>IV: %{y:.2f}%<extra></extra>"
             ),
-            row=2, col=1
+            row=4, col=1
         )
 
     if not iv_df_next.empty:
@@ -1456,16 +1647,16 @@ def build_interactive_dashboard(
                 line=dict(color="#B388FF", width=1.5, dash="dot"),
                 hovertemplate="<b>%{x} Next Q</b><br>IV: %{y:.2f}%<extra></extra>"
             ),
-            row=2, col=1
+            row=4, col=1
         )
 
     fig.add_vline(
         x=futures_ref, line_width=1.5, line_dash="dash", line_color="#78909C",
-        row=2, col=1
+        row=4, col=1
     )
 
     # ----------------------------------------------------
-    # Subplot 3: Open Interest Distribution
+    # Subplot 5: Open Interest Distribution
     # ----------------------------------------------------
     fig.add_trace(
         go.Bar(
@@ -1473,7 +1664,7 @@ def build_interactive_dashboard(
             name="Call OI", marker_color="#29B6F6", opacity=0.85,
             hovertemplate="<b>Strike %{x} Call OI</b>: %{y:,}<extra></extra>"
         ),
-        row=3, col=1
+        row=5, col=1
     )
     fig.add_trace(
         go.Bar(
@@ -1481,14 +1672,14 @@ def build_interactive_dashboard(
             name="Put OI", marker_color="#FF7043", opacity=0.85,
             hovertemplate="<b>Strike %{x} Put OI</b>: %{y:,}<extra></extra>"
         ),
-        row=3, col=1
+        row=5, col=1
     )
 
     fig.add_vline(
         x=max_pain, line_width=2, line_dash="dash", line_color="#FFD600",
         annotation_text=f"Max Pain: {max_pain:.0f}", annotation_position="top left",
         annotation_font=dict(color="#FFD600", size=10),
-        row=3, col=1
+        row=5, col=1
     )
 
     fig.update_layout(
@@ -1496,15 +1687,16 @@ def build_interactive_dashboard(
         title=dict(
             text=f"<b>SET50 PRE-MARKET QUANT RADAR</b> | As of EOD {trade_date} (Flow Regime: {foreign_regime})",
             font=dict(size=18, color="#FFFFFF"),
-            x=0.03, y=0.98
+            x=0.03, y=0.99
         ),
-        height=1000,
-        margin=dict(l=60, r=40, t=90, b=50),
+        height=1750,
+        dragmode=False,
+        margin=dict(l=60, r=60, t=80, b=50),
         barmode="group",
         legend=dict(
             orientation="h",
             yanchor="bottom",
-            y=1.01,
+            y=1.005,
             xanchor="right",
             x=0.98,
             font=dict(size=11)
@@ -1513,15 +1705,30 @@ def build_interactive_dashboard(
         plot_bgcolor="#182232"
     )
 
-    fig.update_xaxes(title_text="Strike Price", gridcolor="#26354A", row=3, col=1)
-    fig.update_xaxes(gridcolor="#26354A", row=1, col=1)
-    fig.update_xaxes(gridcolor="#26354A", row=2, col=1)
-    fig.update_yaxes(title_text="Net GEX (MB/pt)", gridcolor="#26354A", row=1, col=1)
-    fig.update_yaxes(title_text="Implied Volatility (%)", gridcolor="#26354A", row=2, col=1)
-    fig.update_yaxes(title_text="Contracts (OI)", gridcolor="#26354A", row=3, col=1)
+    fig.update_xaxes(gridcolor="#26354A", fixedrange=True, row=1, col=1)
+    fig.update_yaxes(title_text="Price (pts)", gridcolor="#26354A", fixedrange=True, row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="Foreign Net", showgrid=False, fixedrange=True, row=1, col=1, secondary_y=True)
+
+    fig.update_xaxes(gridcolor="#26354A", fixedrange=True, row=2, col=1)
+    fig.update_yaxes(title_text="Volatility (%)", gridcolor="#26354A", fixedrange=True, row=2, col=1)
+
+    fig.update_xaxes(gridcolor="#26354A", fixedrange=True, row=3, col=1)
+    fig.update_yaxes(title_text="Net GEX (MB/pt)", gridcolor="#26354A", fixedrange=True, row=3, col=1)
+
+    fig.update_xaxes(gridcolor="#26354A", fixedrange=True, row=4, col=1)
+    fig.update_yaxes(title_text="Implied Volatility (%)", gridcolor="#26354A", fixedrange=True, row=4, col=1)
+
+    fig.update_xaxes(title_text="Strike Price", gridcolor="#26354A", fixedrange=True, row=5, col=1)
+    fig.update_yaxes(title_text="Contracts (OI)", gridcolor="#26354A", fixedrange=True, row=5, col=1)
+
+    plotly_config = {
+        "displayModeBar": False,
+        "scrollZoom": False,
+        "responsive": True
+    }
 
     html_path = f"premarket_report_{trade_date}.html"
-    fig.write_html(html_path, include_plotlyjs=True, full_html=True)
+    fig.write_html(html_path, include_plotlyjs=True, full_html=True, config=plotly_config)
 
     # Save copy to public/index.html for GitHub Pages deployment
     try:
@@ -1529,10 +1736,12 @@ def build_interactive_dashboard(
         public_dir = os.path.join(script_dir, "public")
         os.makedirs(public_dir, exist_ok=True)
         public_index_path = os.path.join(public_dir, "index.html")
-        fig.write_html(public_index_path, include_plotlyjs=True, full_html=True)
+        fig.write_html(public_index_path, include_plotlyjs=True, full_html=True, config=plotly_config)
         print(f"[PAGES] Dashboard copy successfully saved to {public_index_path}")
     except Exception as e:
         print(f"[PAGES] Warning: Failed to save dashboard to public/index.html: {e}")
+
+    return html_path
 
     return html_path
 
@@ -1632,6 +1841,18 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         flow_regime, flow_emoji, flow_desc = decompose_smart_money(foreign_net, delta_oi)
 
         # Mock Footprint Analytics for Phase 1
+        mock_series_data = []
+        base_date = datetime.date.today() - datetime.timedelta(days=15)
+        for i in range(15):
+            d_str = (base_date + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+            mock_series_data.append({
+                "trade_date": d_str,
+                "foreign_net": 1200 if i % 2 == 0 else -800,
+                "settlement_price": 910.0 + i * 0.6,
+                "cost_basis": 912.0 + i * 0.2,
+                "cum_net": 1000 + i * 400
+            })
+
         mock_foreign_footprint = {
             "cum_foreign_net": 18450,
             "cost_basis": 914.8,
@@ -1641,7 +1862,8 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
             "z_desc": "🚨 Outlier ซื้อหนัก (Z = +1.68 SD)",
             "is_outlier": True,
             "divergence_text": "สอดคล้องกับราคา (Confluent)",
-            "history_days": 60
+            "history_days": 60,
+            "series_data": mock_series_data
         }
         mock_options_footprint = {
             "foreign_call_net": 3250,
@@ -1657,9 +1879,19 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         }
 
         # Mock Intraday Warm-up Analytics for Phase 2
+        mock_vol_time_series = []
+        for i in range(15):
+            d_str = (base_date + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+            mock_vol_time_series.append({
+                "date": d_str,
+                "atm_iv": 0.115 + (i % 3) * 0.003,
+                "rv_annualized": 0.100 + (i % 4) * 0.004 if i % 2 == 0 else None
+            })
+
         mock_intraday_rv = {
             "rv_annualized": 0.1045,
             "bar_count": 320,
+            "is_valid_rv": True,
             "iv_rv_spread": (atm_iv - 0.1045) * 100.0,
             "vol_regime_desc": f"IV Premium สูง (Options แพงกว่าแกว่งจริง +{(atm_iv - 0.1045) * 100.0:.1f}% เหมาะเทรดในกรอบ)"
         }
@@ -1668,6 +1900,7 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
             "vah": 922.0,
             "val": 912.0,
             "warmup_days": 20,
+            "valid_days": 20,
             "confluence_text": f"POC (917) รับราคาปิด | VAH (922) ชน Max Pain ({max_pain:.0f}) ➔ ต้านคอนกรีต"
         }
         mock_late_session = {
@@ -1681,7 +1914,8 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
             trade_date=t_0, futures_ref=futures_ref, front_series=front_series, next_series=next_series,
             res_df=res_df, gamma_flip_cum=gamma_flip_val, call_wall=call_wall, put_wall=put_wall,
             max_pain=max_pain, iv_df_front=pd.DataFrame(), iv_df_next=pd.DataFrame(),
-            foreign_regime=flow_regime, upper_1sd=upper_1sd, lower_1sd=lower_1sd
+            foreign_regime=flow_regime, upper_1sd=upper_1sd, lower_1sd=lower_1sd,
+            foreign_footprint=mock_foreign_footprint, vol_time_series=mock_vol_time_series
         )
 
         now_bkk = datetime.datetime.now(BKK_TZ)
@@ -1945,11 +2179,16 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
     total_net_gex = float(res_df["net_gex_mb"].sum())
 
     # Consistent Gamma Regime: Aligned with current price position relative to Gamma Flip
-    is_positive_gamma = (futures_ref >= gamma_flip_val)
-    if is_positive_gamma:
+    if not math.isnan(gamma_flip_val) and abs(futures_ref - gamma_flip_val) <= 3.0:
+        is_positive_gamma = (futures_ref >= gamma_flip_val)
+        gamma_zone_title = "Neutral / Transitional Gamma (ใกล้จุดเปลี่ยนโซน)"
+        gamma_desc = f"ราคาประชิด Gamma Flip ({gamma_flip_val:.1f}) เป็นจุดหมุนความผันผวน ตลาดอยู่ในช่วงเปลี่ยนผ่าน เหมาะเทรดในกรอบ (Mean Reversion)"
+    elif futures_ref >= gamma_flip_val:
+        is_positive_gamma = True
         gamma_zone_title = "Positive Gamma (โซนลดความผันผวน / Mean Reversion)"
         gamma_desc = f"ราคาปัจจุบัน ({futures_ref:.1f}) อยู่เหนือ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์อยู่ในสถานะ Long Gamma (ซื้อแนวรับ-ขายแนวต้าน) ช่วยซับแรงเหวี่ยง ทำให้ตลาดมักแกว่งตัวในกรอบ"
     else:
+        is_positive_gamma = False
         gamma_zone_title = "Negative Gamma (โซนเร่งความผันผวน / Trend Expansion)"
         gamma_desc = f"ราคาปัจจุบัน ({futures_ref:.1f}) อยู่ใต้ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์อยู่ในสถานะ Short Gamma (ต้องเปิด Hedging ตามแนวโน้ม) หากหลุดแนวรับจะเร่งแรงขายซ้ำเติม ทำให้เกิดความผันผวนสูง"
 
@@ -2069,6 +2308,16 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
     )
     print(f"[INTRADAY] Realized Vol: {intraday_rv['rv_annualized']*100:.2f}% (Bars: {intraday_rv['bar_count']}) vs ATM IV: {atm_iv*100:.2f}% | Spread: {intraday_rv['iv_rv_spread']:+.2f}%")
 
+    vol_time_series = fetch_volatility_time_series(
+        pipeline_url=pipeline_url,
+        auth_token=turso_token,
+        current_date=t_0,
+        current_atm_iv=atm_iv,
+        current_rv=intraday_rv["rv_annualized"],
+        is_valid_rv=intraday_rv["is_valid_rv"],
+        lookback_days=60
+    )
+
     print("[INTRADAY] Computing 20-Day Rolling Volume Profile (POC, VAH, VAL)...")
     volume_profile = compute_volume_profile(
         pipeline_url=pipeline_url,
@@ -2110,7 +2359,9 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         iv_df_next=next_opts,
         foreign_regime=flow_regime,
         upper_1sd=upper_1sd,
-        lower_1sd=lower_1sd
+        lower_1sd=lower_1sd,
+        foreign_footprint=foreign_footprint,
+        vol_time_series=vol_time_series
     )
     print(f"[CHART] Interactive Plotly report generated: {html_file}")
 
