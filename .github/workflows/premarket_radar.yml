@@ -1,9 +1,6 @@
 name: Pre-Market Quant Radar
 
 on:
-  schedule:
-    # 06:45 ICT (UTC+7) Mon-Fri -> 23:45 UTC Sun-Thu
-    - cron: '45 23 * * 0-4'
   workflow_dispatch:
     inputs:
       force_run:
