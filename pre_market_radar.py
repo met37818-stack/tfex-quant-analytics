@@ -639,7 +639,9 @@ def analyze_options_footprint(
             iv_0 = calculate_implied_vol(px_0, futures_ref_t0, strike, T_front_t0, r_rf, otype)
             iv_prev = calculate_implied_vol(px_prev, futures_ref_tprev, strike, T_front_tprev, r_rf, otype)
 
-            if not np.isnan(iv_0) and not np.isnan(iv_prev):
+            is_valid_0 = (iv_0 is not None and not np.isnan(iv_0))
+            is_valid_prev = (iv_prev is not None and not np.isnan(iv_prev))
+            if is_valid_0 and is_valid_prev:
                 div = (iv_0 - iv_prev) * 100.0
             else:
                 div = 0.0
@@ -2062,8 +2064,15 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         r_rf=r_rf
     )
     print(f"[FOOTPRINT] Options Foreign Net: Call {options_footprint['foreign_call_net']:+,} | Put {options_footprint['foreign_put_net']:+,}")
-    print(f"[FOOTPRINT] Top Call Expansion: Strike {options_footprint['top_call_strike']:.0f} (ΔOI: {options_footprint['top_call_doi']:+,}, ΔIV: {options_footprint['top_call_div']:+.2f}%) -> {options_footprint['call_intent']}")
-    print(f"[FOOTPRINT] Top Put Expansion : Strike {options_footprint['top_put_strike']:.0f} (ΔOI: {options_footprint['top_put_doi']:+,}, ΔIV: {options_footprint['top_put_div']:+.2f}%) -> {options_footprint['put_intent']}")
+    if options_footprint.get("top_call_strike") is not None:
+        print(f"[FOOTPRINT] Top Call Expansion: Strike {options_footprint['top_call_strike']:.0f} (ΔOI: {options_footprint['top_call_doi']:+,}, ΔIV: {options_footprint['top_call_div']:+.2f}%) -> {options_footprint['call_intent']}")
+    else:
+        print(f"[FOOTPRINT] Top Call Expansion: {options_footprint['call_intent']}")
+
+    if options_footprint.get("top_put_strike") is not None:
+        print(f"[FOOTPRINT] Top Put Expansion : Strike {options_footprint['top_put_strike']:.0f} (ΔOI: {options_footprint['top_put_doi']:+,}, ΔIV: {options_footprint['top_put_div']:+.2f}%) -> {options_footprint['put_intent']}")
+    else:
+        print(f"[FOOTPRINT] Top Put Expansion : {options_footprint['put_intent']}")
 
     # 7.2 Intraday Warm-up Analytics (Realized Volatility, Volume Profile, Late-Session Flow)
     print("[INTRADAY] Computing Annualized Realized Volatility (RV) from 1-min bars...")
