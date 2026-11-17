@@ -1728,8 +1728,28 @@ def build_interactive_dashboard(
         "responsive": True
     }
 
+    raw_html = fig.to_html(include_plotlyjs=True, full_html=True, config=plotly_config)
+
+    custom_injections = """
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <style>
+        .js-plotly-plot, .plotly, .plot-container {
+            pointer-events: none !important;
+            touch-action: pan-x pan-y pinch-zoom !important;
+        }
+    </style>
+"""
+
+    if "</head>" in raw_html:
+        final_html = raw_html.replace("</head>", f"{custom_injections}\n</head>", 1)
+    else:
+        final_html = custom_injections + "\n" + raw_html
+
     html_path = f"premarket_report_{trade_date}.html"
-    fig.write_html(html_path, include_plotlyjs=True, full_html=True, config=plotly_config)
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(final_html)
 
     # Save copy to public/index.html for GitHub Pages deployment
     try:
@@ -1737,12 +1757,11 @@ def build_interactive_dashboard(
         public_dir = os.path.join(script_dir, "public")
         os.makedirs(public_dir, exist_ok=True)
         public_index_path = os.path.join(public_dir, "index.html")
-        fig.write_html(public_index_path, include_plotlyjs=True, full_html=True, config=plotly_config)
+        with open(public_index_path, "w", encoding="utf-8") as f:
+            f.write(final_html)
         print(f"[PAGES] Dashboard copy successfully saved to {public_index_path}")
     except Exception as e:
         print(f"[PAGES] Warning: Failed to save dashboard to public/index.html: {e}")
-
-    return html_path
 
     return html_path
 
