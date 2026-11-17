@@ -1187,13 +1187,13 @@ def generate_thai_trading_playbook(
         late_basis_delta = late_session.get("late_basis_delta", 0.0)
         late_session_desc = late_session.get("late_session_desc", "N/A")
 
-        intraday_block = f"""📊 <b>3. โครงสร้าง Intraday & ความผันผวน (Warm-up: {warmup_days}/20 วัน)</b>
+        intraday_block = f"""📊 <b>3. โครงสร้าง Intraday & ความผันผวน ({warmup_days}/20 วัน)</b>
 • <b>Realized vs Implied Vol:</b> RV <code>{rv_ann * 100:.2f}%</code> vs ATM IV <code>{atm_iv * 100:.2f}%</code> ({bar_count} บาร์)
   └ <i>สภาวะ: {vol_regime_desc}</i>
 • <b>Intraday Volume Profile:</b>
   - <b>POC:</b> <code>{poc:.0f}</code> จุด | <b>Value Area (70%):</b> <code>{val:.0f}</code> – <code>{vah:.0f}</code> จุด
   - <b>Confluence Zone:</b> {confluence_text}
-• <b>พฤติกรรมท้ายตลาด (16:30–16:55 น.):</b>
+• <b>ช่วงท้ายตลาด (16:30–16:55 น.):</b>
   - Futures: <code>{late_fut_delta:+.1f}</code> จุด | Basis ปิด: <code>{late_basis_close:+.2f}</code> (ΔBasis: <code>{late_basis_delta:+.2f}</code>)
   - <i>บทสรุป: {late_session_desc}</i>
 """
@@ -1207,9 +1207,9 @@ def generate_thai_trading_playbook(
         f_z_desc = foreign_footprint.get("z_desc", "N/A")
         f_div_text = foreign_footprint.get("divergence_text", "N/A")
         f_days = foreign_footprint.get("history_days", 60)
-        foreign_footprint_block = f"""• <b>สถิติแกะรอยต่างชาติสะสม ({f_days} วันทำการ):</b>
+        foreign_footprint_block = f"""• <b>สถิติต่างชาติสะสม ({f_days} วัน):</b>
   - ยอดสะสม: <code>{f_cum:+,}</code> สัญญา | ต้นทุนเฉลี่ย: <code>{f_cost:.1f}</code> จุด <i>({f_pnl_status})</i>
-  - Flow Z-Score (20 วัน): {f_z_desc} | Divergence: {f_div_text}"""
+  - Flow Z-Score (20D): {f_z_desc} | Divergence: {f_div_text}"""
     else:
         foreign_footprint_block = ""
 
@@ -1298,20 +1298,20 @@ def generate_thai_trading_playbook(
     msg = f"""🎯 <b>แผนการเทรด SET50 ประจำวัน | TFEX QUANT RADAR</b>
 📅 <i>ข้อมูลสิ้นวัน {trade_date} | ออกรายงานเช้า {as_of_time_bkk} น.</i>
 ━━━━━━━━━━━━━━━━━━━━━━
-🎯 <b>1. กรอบวิ่งคาดการณ์วันนี้ (1-Day Expected Move)</b>
+🎯 <b>1. กรอบวิ่งคาดการณ์ (1-Day Expected Move)</b>
 • <b>กรอบราคา 1-SD:</b> <code>{lower_1sd:.1f}</code> – <code>{upper_1sd:.1f}</code> จุด <i>(ระยะแกว่ง ±{expected_move_1d:.1f} จุด)</i>
 • <b>ระดับความผันผวน (ATM IV):</b> <code>{atm_iv * 100:.2f}%</code> <i>({iv_desc})</i>
 
-🧱 <b>2. แนวรับ - แนวต้านสำคัญรายวัน (Tactical Key Levels)</b>
+🧱 <b>2. แนวรับ - แนวต้านสำคัญ (Tactical Key Levels)</b>
 🔴 <b>ต้าน 2:</b> <code>{res_2:.0f}</code> <i>({res_2_oi:,})</i> | <b>ต้าน 1:</b> <code>{res_1:.0f}</code> <i>({res_1_oi:,})</i>
 📍 <b>ราคาปิดล่าสุด ({front_series}):</b> <code>{futures_ref:.1f}</code> จุด <i>(Max Pain: <code>{max_pain:.0f}</code>)</i>
 🟢 <b>รับ 1:</b> <code>{sup_1:.0f}</code> <i>({sup_1_oi:,})</i> | <b>รับ 2:</b> <code>{sup_2:.0f}</code> <i>({sup_2_oi:,})</i>
 ───────────────
-🏛️ <i>กรอบใหญ่ไตรมาส: Put Wall <code>{put_wall:.0f}</code> – Call Wall <code>{call_wall:.0f}</code> | Gamma Flip: <code>{gamma_flip_str}</code></i>
+🏛️ <i>กรอบไตรมาส: Put Wall <code>{put_wall:.0f}</code> – Call Wall <code>{call_wall:.0f}</code> | Gamma Flip: <code>{gamma_flip_str}</code></i>
 
 {body_content}
 
-⚔️ <b>5. กลยุทธ์และแผนการเล่นวันนี้ (Daily Action Plan)</b>
+⚔️ <b>5. กลยุทธ์และแผนการเทรด (Daily Action Plan)</b>
 • <b>สภาวะตลาด (Dealer Gamma):</b> {gamma_emoji} <b>{gamma_zone_title}</b>
   <i>({gamma_desc_compact})</i>
 {cost_narrative}• <b>แผนการปฏิบัติหน้างาน:</b>
@@ -1320,7 +1320,7 @@ def generate_thai_trading_playbook(
   🔴 <b>ฝั่ง Short:</b> {short_plan}
   ⚠️ <b>จุดตัดขาดทุน (Stop Loss):</b> {stop_loss_plan}
 ━━━━━━━━━━━━━━━━━━━━━━
-🕒 <i>แนบไฟล์กราฟอินเทอร์แอคทีฟ (.html) เปิดดูโครงสร้าง GEX & IV Curve ได้ทันที</i>"""
+🌐 <b>เปิดดูกราฟ Interactive:</b> <a href="https://met37818-stack.github.io/tfex-quant-analytics/">คลิกเปิดใน Chrome ทันที</a>"""
     return msg
 
 # ==============================================================================
@@ -1522,6 +1522,18 @@ def build_interactive_dashboard(
 
     html_path = f"premarket_report_{trade_date}.html"
     fig.write_html(html_path, include_plotlyjs=True, full_html=True)
+
+    # Save copy to public/index.html for GitHub Pages deployment
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        public_dir = os.path.join(script_dir, "public")
+        os.makedirs(public_dir, exist_ok=True)
+        public_index_path = os.path.join(public_dir, "index.html")
+        fig.write_html(public_index_path, include_plotlyjs=True, full_html=True)
+        print(f"[PAGES] Dashboard copy successfully saved to {public_index_path}")
+    except Exception as e:
+        print(f"[PAGES] Warning: Failed to save dashboard to public/index.html: {e}")
+
     return html_path
 
 # ==============================================================================
@@ -1535,11 +1547,10 @@ def send_telegram_alert(
     html_file_path: str = None
 ) -> bool:
     """
-    Sends rich HTML summary message and uploads interactive Plotly HTML report.
+    Sends rich HTML summary message with direct link to GitHub Pages dashboard.
     """
     base_url = f"https://api.telegram.org/bot{bot_token}"
 
-    # 1. Send Text Briefing
     msg_url = f"{base_url}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -1552,33 +1563,6 @@ def send_telegram_alert(
         print(f"[TELEGRAM] Warning: sendMessage failed ({r.status_code}): {r.text}")
         return False
     print("[TELEGRAM] Pre-market summary text delivered successfully.")
-
-    # 2. Send Document (Plotly HTML)
-    if html_file_path and os.path.exists(html_file_path):
-        doc_url = f"{base_url}/sendDocument"
-        caption = f"📊 <b>SET50 Quant Radar Interactive Dashboard</b> ({os.path.basename(html_file_path)})"
-        with open(html_file_path, "rb") as f:
-            file_bytes = f.read()
-
-        for attempt in range(1, 4):
-            try:
-                files = {"document": (os.path.basename(html_file_path), file_bytes, "text/html")}
-                doc_data = {
-                    "chat_id": chat_id,
-                    "caption": caption,
-                    "parse_mode": "HTML"
-                }
-                r_doc = requests.post(doc_url, data=doc_data, files=files, timeout=(20, 120))
-                if r_doc.status_code == 200:
-                    print(f"[TELEGRAM] Interactive HTML chart delivered successfully on attempt {attempt}.")
-                    break
-                else:
-                    print(f"[TELEGRAM] Attempt {attempt} warning: sendDocument status {r_doc.status_code}: {r_doc.text}")
-            except Exception as e:
-                print(f"[TELEGRAM] Attempt {attempt} failed to upload document: {e}")
-                if attempt == 3:
-                    print("[TELEGRAM] Max attempts reached for document upload.")
-
     return True
 
 # ==============================================================================

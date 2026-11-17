@@ -4,6 +4,7 @@
 # Generated reports & temporary files
 *.html
 *.db
+public/
 
 # Python
 __pycache__/

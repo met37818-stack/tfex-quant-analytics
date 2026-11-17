@@ -12,8 +12,20 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
 jobs:
   run-radar:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -42,3 +54,23 @@ jobs:
           else
             python pre_market_radar.py
           fi
+
+      - name: Check if public directory exists
+        id: check_public
+        run: |
+          if [ -d "public" ] && [ -f "public/index.html" ]; then
+            echo "has_pages=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_pages=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload Pages Artifact
+        if: steps.check_public.outputs.has_pages == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: 'public'
+
+      - name: Deploy to GitHub Pages
+        if: steps.check_public.outputs.has_pages == 'true'
+        id: deployment
+        uses: actions/deploy-pages@v4
