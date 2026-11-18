@@ -132,6 +132,54 @@ def execute_turso_sql(pipeline_url: str, auth_token: str, sql: str, args: list =
         rows.append(parsed_row)
     return cols, rows
 
+def select_dynamic_thor_rate(
+    thor_record: dict,
+    dte: int
+) -> tuple[float, str]:
+    """
+    Selects dynamic THOR rate matching the option's DTE (Days to Expiration).
+    
+    Tenor Selection Rules:
+    - dte <= 30 days:
+        Prefer 1M Compounded ('1m')
+        Fallback: Overnight ('overnight')
+    - 30 < dte <= 90 days:
+        Prefer 3M Compounded ('3m')
+        Fallback: 1M Compounded ('1m') -> Overnight ('overnight')
+    - 90 < dte <= 180 days:
+        Prefer 6M Compounded ('6m')
+        Fallback: 3M Compounded ('3m') -> 1M Compounded -> Overnight
+    - dte > 180 days:
+        Prefer 6M Compounded ('6m')
+        Fallback: 3M Compounded -> Overnight
+    """
+    def _clean(val):
+        if val is None or float(val) <= 0:
+            return None
+        v = float(val)
+        return v / 100.0 if v > 0.5 else v
+
+    r_on = _clean(thor_record.get("overnight"))
+    r_1m = _clean(thor_record.get("1m"))
+    r_3m = _clean(thor_record.get("3m"))
+    r_6m = _clean(thor_record.get("6m"))
+
+    if dte <= 30:
+        candidates = [("1M", r_1m), ("ON", r_on), ("3M", r_3m), ("6M", r_6m)]
+    elif dte <= 90:
+        candidates = [("3M", r_3m), ("1M", r_1m), ("ON", r_on), ("6M", r_6m)]
+    elif dte <= 180:
+        candidates = [("6M", r_6m), ("3M", r_3m), ("1M", r_1m), ("ON", r_on)]
+    else:
+        candidates = [("6M", r_6m), ("3M", r_3m), ("ON", r_on), ("1M", r_1m)]
+
+    for label, rate in candidates:
+        if rate is not None and rate > 0:
+            return rate, label
+
+    return 0.015, "DEFAULT"
+
+
 def init_analytics_tables(pipeline_url: str, auth_token: str):
     """Ensure analytics_premarket_log and daily_realized_vol tables exist."""
     ddl = """
@@ -2239,15 +2287,19 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
     print(f"[STRUCTURE] Front Quarter Series: {front_series} (Settlement: {futures_ref:.1f}, OI: {futures_dict[front_series]['oi']:,})")
     print(f"[STRUCTURE] Next Quarter Series : {next_series} (Settlement: {futures_dict[next_series]['settlement']:.1f}, OI: {futures_dict[next_series]['oi']:,})")
 
-    # 4.3 THOR Interest Rate
+    # 4.3 THOR Interest Rate (All Tenors for Dynamic Matching)
     _, thor_rows = execute_turso_sql(
         pipeline_url, turso_token,
-        "SELECT thor_rate FROM eod_thor_rates WHERE trade_date <= ? ORDER BY trade_date DESC LIMIT 1;",
+        "SELECT thor_rate, thor_1m_avg, thor_3m_avg, thor_6m_avg FROM eod_thor_rates WHERE trade_date <= ? ORDER BY trade_date DESC LIMIT 1;",
         [t_0]
     )
-    thor_rate_pct = float(thor_rows[0][0]) if thor_rows and thor_rows[0][0] is not None else 1.00
-    r_rf = thor_rate_pct / 100.0
-    print(f"[STRUCTURE] Risk-free Rate (THOR): {thor_rate_pct:.4f}% (r = {r_rf:.6f})")
+    thor_dict = {"overnight": None, "1m": None, "3m": None, "6m": None}
+    if thor_rows and thor_rows[0]:
+        r_th = thor_rows[0]
+        thor_dict["overnight"] = r_th[0] if len(r_th) > 0 else None
+        thor_dict["1m"] = r_th[1] if len(r_th) > 1 else None
+        thor_dict["3m"] = r_th[2] if len(r_th) > 2 else None
+        thor_dict["6m"] = r_th[3] if len(r_th) > 3 else None
 
     # 4.4 Expiry Calculations (Penultimate Business Day)
     t_0_dt = datetime.datetime.strptime(t_0, "%Y-%m-%d").date()
@@ -2260,6 +2312,14 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
     T_next = days_to_exp_next / 365.0
     print(f"[EXPIRY] {front_series} Expiry: {expiry_front} ({days_to_exp_front:.0f} calendar days, T = {T_front:.4f} yrs)")
     print(f"[EXPIRY] {next_series} Expiry: {expiry_next} ({days_to_exp_next:.0f} calendar days, T = {T_next:.4f} yrs)")
+
+    # Dynamic Tenor Selection for Front & Next series
+    r_rf_front, tenor_front = select_dynamic_thor_rate(thor_dict, int(days_to_exp_front))
+    r_rf_next, tenor_next = select_dynamic_thor_rate(thor_dict, int(days_to_exp_next))
+    r_rf = r_rf_front
+    thor_rate = r_rf_front
+    print(f"[STRUCTURE] Front Risk-free Rate (THOR {tenor_front}): {r_rf_front*100.0:.4f}% (r = {r_rf_front:.6f})")
+    print(f"[STRUCTURE] Next Risk-free Rate (THOR {tenor_next}): {r_rf_next*100.0:.4f}% (r = {r_rf_next:.6f})")
 
     # 4.5 Options Series Data
     cols_o, rows_o = execute_turso_sql(
@@ -2278,7 +2338,7 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         p = float(opt["settlement_price"]) if opt["settlement_price"] is not None else 0.0
         k = float(opt["strike"])
         otype = str(opt["option_type"]).upper()
-        iv = calculate_implied_vol(p, futures_ref, k, T_front, r_rf, otype)
+        iv = calculate_implied_vol(p, futures_ref, k, T_front, r_rf_front, otype)
         front_iv_list.append(iv)
     front_opts["iv"] = front_iv_list
 
@@ -2290,7 +2350,7 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         p = float(opt["settlement_price"]) if opt["settlement_price"] is not None else 0.0
         k = float(opt["strike"])
         otype = str(opt["option_type"]).upper()
-        iv = calculate_implied_vol(p, next_ref, k, T_next, r_rf, otype)
+        iv = calculate_implied_vol(p, next_ref, k, T_next, r_rf_next, otype)
         next_iv_list.append(iv)
     next_opts["iv"] = next_iv_list
 
