@@ -239,10 +239,10 @@ def calculate_implied_vol(price: float, F: float, K: float, T: float, r: float, 
 
 def calculate_black76_greeks(F: float, K: float, T: float, r: float, sigma: float, option_type: str) -> dict:
     """
-    Compute Delta, Gamma, Vega, and Theta under Black-76.
+    Compute Delta, Gamma, Vega, Theta, Vanna, and Charm under Black-76.
     """
-    if sigma <= 0.0 or T <= 0.0:
-        return {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0}
+    if sigma <= 0.0 or T <= 0.0 or F <= 0.0 or K <= 0.0:
+        return {"delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "vanna": 0.0, "charm": 0.0}
 
     sqrt_T = math.sqrt(T)
     d1 = (math.log(F / K) + 0.5 * sigma * sigma * T) / (sigma * sqrt_T)
@@ -257,16 +257,183 @@ def calculate_black76_greeks(F: float, K: float, T: float, r: float, sigma: floa
         delta = disc * norm.cdf(d1)
         theta_call = - (F * disc * pdf_d1 * sigma) / (2.0 * sqrt_T) - r * disc * (F * norm.cdf(d1) - K * norm.cdf(d2))
         theta_1d = theta_call / 365.0
+        charm_1d = (r * disc * norm.cdf(d1) + disc * pdf_d1 * (d2 / (2.0 * T))) / 365.0
     else:
         delta = -disc * norm.cdf(-d1)
         theta_put = - (F * disc * pdf_d1 * sigma) / (2.0 * sqrt_T) - r * disc * (K * norm.cdf(-d2) - F * norm.cdf(-d1))
         theta_1d = theta_put / 365.0
+        charm_1d = (-r * disc * norm.cdf(-d1) + disc * pdf_d1 * (d2 / (2.0 * T))) / 365.0
+
+    vanna = -disc * pdf_d1 * (d2 / sigma)
 
     return {
         "delta": float(delta),
         "gamma": float(gamma),
         "vega": float(vega_1pct),
-        "theta": float(theta_1d)
+        "theta": float(theta_1d),
+        "vanna": float(vanna),
+        "charm": float(charm_1d)
+    }
+
+def analyze_options_greeks_edge(
+    pipeline_url: str,
+    auth_token: str,
+    trade_date: str,
+    front_series: str,
+    futures_ref: float,
+    thor_rate: float,
+    T_front: float,
+    front_opts_df: pd.DataFrame = None
+) -> dict:
+    """
+    Analyzes 3 Dimensions of Options Greeks Edge from eod_options_greeks:
+    1. 25-Delta Skew (IV_25DP - IV_25DC)
+    2. ATM Theta-to-Gamma Ratio and Daily Breakeven Move (sqrt(2*|Theta|/Gamma))
+    3. Market Maker / Dealer Flow (Net Dealer Vanna & Charm Exposure)
+    """
+    greeks_records = []
+    underlying = front_series if front_series.startswith("S50") else f"S50{front_series}"
+
+    # 1. Query pre-computed Greeks from eod_options_greeks in Turso
+    if pipeline_url and auth_token:
+        sql = """
+        SELECT symbol, option_type, strike, iv, delta, gamma, theta, vega, vanna, charm, open_interest
+        FROM eod_options_greeks
+        WHERE trade_date = ? AND (underlying_futures = ? OR series = ?) AND iv IS NOT NULL;
+        """
+        try:
+            _, rows = execute_turso_sql(pipeline_url, auth_token, sql, [trade_date, underlying, front_series])
+            for r in rows:
+                if r[3] is not None and r[4] is not None:
+                    greeks_records.append({
+                        "symbol": str(r[0]),
+                        "option_type": str(r[1]).upper(),
+                        "strike": float(r[2]),
+                        "iv": float(r[3]),
+                        "delta": float(r[4]),
+                        "gamma": float(r[5]),
+                        "theta": float(r[6]),
+                        "vega": float(r[7]),
+                        "vanna": float(r[8]),
+                        "charm": float(r[9]),
+                        "oi": int(r[10]) if r[10] else 0
+                    })
+        except Exception as e:
+            print(f"[GREEKS EDGE] Note checking eod_options_greeks: {e}")
+
+    # Fallback to computing on-the-fly from front_opts_df (for test mode or if table not yet populated)
+    if not greeks_records and front_opts_df is not None and not front_opts_df.empty:
+        for _, row in front_opts_df.iterrows():
+            k = float(row["strike"])
+            otype = str(row["option_type"]).upper()
+            oi = int(row.get("oi", 0)) if row.get("oi") else 0
+            price = float(row["settlement_price"]) if row.get("settlement_price") and row["settlement_price"] > 0 else float(row.get("close", 0) or 0)
+            if price > 0:
+                iv = calculate_implied_vol(price, futures_ref, k, T_front, thor_rate, otype)
+                if iv and iv > 0.0001:
+                    g = calculate_black76_greeks(futures_ref, k, T_front, thor_rate, iv, otype)
+                    greeks_records.append({
+                        "symbol": row.get("symbol", f"{front_series}{otype}{k:.0f}"),
+                        "option_type": otype,
+                        "strike": k,
+                        "iv": iv,
+                        "delta": g["delta"],
+                        "gamma": g["gamma"],
+                        "theta": g["theta"],
+                        "vega": g["vega"],
+                        "vanna": g["vanna"],
+                        "charm": g["charm"],
+                        "oi": oi
+                    })
+
+    if not greeks_records:
+        return {
+            "skew_25d": 0.0, "c_iv_pct": 0.0, "p_iv_pct": 0.0,
+            "skew_desc": "ข้อมูล Greeks ไม่เพียงพอ", "atm_strike": futures_ref,
+            "atm_gamma": 0.0, "atm_theta": 0.0, "theta_gamma_ratio": 0.0,
+            "daily_breakeven_move": 0.0, "dealer_vanna": 0.0, "dealer_charm": 0.0,
+            "vanna_bias_desc": "N/A", "records_count": 0
+        }
+
+    # 1. 25-Delta Skew Calculation (Interpolated)
+    calls = [r for r in greeks_records if r["option_type"] == "C"]
+    puts = [r for r in greeks_records if r["option_type"] == "P"]
+    calls.sort(key=lambda x: x["delta"], reverse=True)
+    puts.sort(key=lambda x: abs(x["delta"]))
+
+    c_iv_25 = None
+    for i in range(len(calls) - 1):
+        d1, d2 = calls[i]["delta"], calls[i + 1]["delta"]
+        if (d1 >= 0.25 >= d2) or (d1 <= 0.25 <= d2):
+            iv1, iv2 = calls[i]["iv"], calls[i + 1]["iv"]
+            c_iv_25 = iv1 + (0.25 - d1) * (iv2 - iv1) / (d2 - d1) if d2 != d1 else iv1
+            break
+    if c_iv_25 is None and calls:
+        c_iv_25 = min(calls, key=lambda x: abs(x["delta"] - 0.25))["iv"]
+
+    p_iv_25 = None
+    for i in range(len(puts) - 1):
+        d1, d2 = abs(puts[i]["delta"]), abs(puts[i + 1]["delta"])
+        if (d1 <= 0.25 <= d2) or (d1 >= 0.25 >= d2):
+            iv1, iv2 = puts[i]["iv"], puts[i + 1]["iv"]
+            p_iv_25 = iv1 + (0.25 - d1) * (iv2 - iv1) / (d2 - d1) if d2 != d1 else iv1
+            break
+    if p_iv_25 is None and puts:
+        p_iv_25 = min(puts, key=lambda x: abs(abs(x["delta"]) - 0.25))["iv"]
+
+    c_iv_pct = (c_iv_25 * 100.0) if c_iv_25 else 0.0
+    p_iv_pct = (p_iv_25 * 100.0) if p_iv_25 else 0.0
+    skew_25d = p_iv_pct - c_iv_pct
+
+    if skew_25d > 2.0:
+        skew_desc = "Put แพงกว่า Call (ตลาดกังวลความเสี่ยงขาลง / พรีเมียมประกันพอร์ตสูง)"
+    elif skew_25d < -1.0:
+        skew_desc = "Call แพงกว่า Put (ตลาดไล่ซื้อ Call เก็งกำไร / Upside Call Skew)"
+    else:
+        skew_desc = "ความกลัว-โลภสองฝั่งสมดุล (Normal Skew)"
+
+    # 2. ATM Theta-to-Gamma Edge & Daily Breakeven Move
+    if calls and puts:
+        atm_c = min(calls, key=lambda x: abs(x["strike"] - futures_ref))
+        atm_p = min(puts, key=lambda x: abs(x["strike"] - futures_ref))
+        atm_strike = atm_c["strike"]
+        atm_gamma = (atm_c["gamma"] + atm_p["gamma"]) / 2.0
+        atm_theta = (abs(atm_c["theta"]) + abs(atm_p["theta"])) / 2.0
+        theta_gamma_ratio = (atm_theta / atm_gamma) if atm_gamma > 0 else 0.0
+        daily_breakeven_move = math.sqrt(2.0 * atm_theta / atm_gamma) if atm_gamma > 0 else 0.0
+    else:
+        atm_strike = futures_ref
+        atm_gamma = 0.0
+        atm_theta = 0.0
+        theta_gamma_ratio = 0.0
+        daily_breakeven_move = 0.0
+
+    # 3. Market Maker Dealer Flow (Net Dealer Vanna & Charm Exposure)
+    # Dealer is short customer OI
+    dealer_vanna = -sum(r["vanna"] * r["oi"] for r in greeks_records) * 0.01
+    dealer_charm = -sum(r["charm"] * r["oi"] for r in greeks_records)
+
+    if dealer_vanna > 50:
+        vanna_bias_desc = "หาก IV Crush ดีลเลอร์จะซื้อ Futures พยุงตลาด"
+    elif dealer_vanna < -50:
+        vanna_bias_desc = "หาก IV Crush ดีลเลอร์จะขาย Futures กดดันตลาด"
+    else:
+        vanna_bias_desc = "พอร์ตดีลเลอร์สมดุลต่อการเปลี่ยนแปลง IV"
+
+    return {
+        "skew_25d": skew_25d,
+        "c_iv_pct": c_iv_pct,
+        "p_iv_pct": p_iv_pct,
+        "skew_desc": skew_desc,
+        "atm_strike": atm_strike,
+        "atm_gamma": atm_gamma,
+        "atm_theta": atm_theta,
+        "theta_gamma_ratio": theta_gamma_ratio,
+        "daily_breakeven_move": daily_breakeven_move,
+        "dealer_vanna": dealer_vanna,
+        "dealer_charm": dealer_charm,
+        "vanna_bias_desc": vanna_bias_desc,
+        "records_count": len(greeks_records)
     }
 
 # ==============================================================================
@@ -1173,7 +1340,8 @@ def generate_thai_trading_playbook(
     options_footprint: dict = None,
     intraday_rv: dict = None,
     volume_profile: dict = None,
-    late_session: dict = None
+    late_session: dict = None,
+    greeks_edge: dict = None
 ) -> str:
     """
     Constructs an actionable, rule-based frontline trading plan in Thai.
@@ -1206,40 +1374,35 @@ def generate_thai_trading_playbook(
     # 2. Smart Money Translation & Actionable Playbook Logic
     if foreign_net > 0 and delta_oi > 0:
         flow_title = "New Long Build-up (ต่างชาติเปิดสะสม Long ใหม่)"
-        flow_detail = f"ต่างชาติซื้อสุทธิ <code>{foreign_net:+,}</code> พร้อม OI ขยาย <code>{delta_oi:+,}</code> สัญญา เป็นการเปิด Long ใหม่หนุนตลาดขึ้น"
-        flow_caution = f"หากผ่านต้าน 1 (<code>{res_1:.0f}</code>) ได้ โมเมนตัมจะพาไปทดสอบ Upper 1-SD หรือต้าน 2 (<code>{res_2:.0f}</code>)"
+        flow_detail = "ซื้อสุทธิพร้อม OI ขยายตัว เป็นการเปิด Long ใหม่หนุนตลาดขึ้น"
         action_strategy = "Follow-Through ฝั่ง Long ตามโมเมนตัม ไม่ดักสวนเทรนด์"
-        long_plan = f"รอจังหวะย่อตัวแถว รับ 1 (<code>{sup_1:.0f}</code>) หรือราคาเปิด ยืนได้เปิด Long เป้าหมาย <code>{res_1:.0f}</code> และ <code>{upper_1sd:.1f}</code>"
-        short_plan = f"ชะลอการ Short จนกว่าจะขึ้นทดสอบ ต้าน 2 (<code>{res_2:.0f}</code>) หรือ Upper 1-SD แล้วเกิดสัญญาณ Rejection ไม่ผ่าน"
-        stop_loss_plan = f"ฝั่ง Long วาง Stop Loss เมื่อราคาหลุด <code>{min(sup_2, f_cost):.0f}</code> จุด (แนว Defense ฝรั่ง)"
+        long_plan = f"ย่อแถว รับ 1 (<code>{sup_1:.0f}</code>) ยืนได้เปิด Long เป้า <code>{res_1:.0f}</code> และ <code>{upper_1sd:.1f}</code>"
+        short_plan = f"ชะลอ Short จนกว่าจะขึ้นทดสอบ ต้าน 2 (<code>{res_2:.0f}</code>) หรือ Upper 1-SD แล้ว Rejection ไม่ผ่าน"
+        stop_loss_plan = f"ฝั่ง Long วาง Stop Loss เมื่อหลุด <code>{min(sup_2, f_cost):.0f}</code> จุด (แนว Defense ฝรั่ง)"
     elif foreign_net > 0 and delta_oi < 0:
         flow_title = "Short Covering (ต่างชาติปิดทำกำไร Short)"
-        flow_detail = f"ต่างชาติซื้อสุทธิ <code>{foreign_net:+,}</code> แต่ OI ลด <code>{delta_oi:+,}</code> สัญญา เป็นแรงซื้อคืนปิด Short เดิม"
-        flow_caution = f"การดีดตัวอาจเป็นเพียง Technical Rebound ระยะสั้น ระวังแรงขายทำกำไรบริเวณแนวต้าน ต้าน 1 หรือ Max Pain (<code>{max_pain:.0f}</code>)"
-        action_strategy = "เน้นเล่นรอบในกรอบ (Range-Bound / Mean Reversion) ดักย่อซื้อ-เด้งขาย ไม่ไล่ราคา"
-        long_plan = f"รอตั้งรับบริเวณ Lower 1-SD (<code>{lower_1sd:.1f}</code>) หรือ รับ 1 (<code>{sup_1:.0f}</code>) เป้าทำกำไรที่ Max Pain (<code>{max_pain:.0f}</code>) หรือ ต้าน 1"
-        short_plan = f"หากเปิดกระโดดขึ้นทดสอบ ต้าน 1 (<code>{res_1:.0f}</code>) หรือ Upper 1-SD (<code>{upper_1sd:.1f}</code>) แล้วไม่ผ่าน พิจารณาดัก Short เล่นรอบย่อ"
-        stop_loss_plan = f"ฝั่ง Long คัตเมื่อหลุด <code>{sup_2:.0f}</code> | ฝั่ง Short คัตเมื่อทะลุเหนือ <code>{res_1 + 3.0:.1f}</code>"
+        flow_detail = "ซื้อสุทธิแต่ OI ลดลง เป็นแรงซื้อคืนปิด Short เดิมเพื่อลดพอร์ต"
+        action_strategy = "เน้นเล่นรอบในกรอบ (Mean Reversion) ดักย่อซื้อ-เด้งขาย ไม่ไล่ราคา"
+        long_plan = f"ตั้งรับ Lower 1-SD (<code>{lower_1sd:.1f}</code>) หรือ รับ 1 (<code>{sup_1:.0f}</code>) เป้า Max Pain (<code>{max_pain:.0f}</code>) หรือ ต้าน 1"
+        short_plan = f"เปิดกระโดดชน ต้าน 1 (<code>{res_1:.0f}</code>) หรือ Upper 1-SD (<code>{upper_1sd:.1f}</code>) ไม่ผ่าน ดัก Short เล่นรอบย่อ"
+        stop_loss_plan = f"ฝั่ง Long คัตเมื่อหลุด <code>{sup_2:.0f}</code> | ฝั่ง Short คัตเมื่อทะลุ <code>{res_1 + 3.0:.1f}</code>"
     elif foreign_net < 0 and delta_oi > 0:
         flow_title = "New Short Build-up (ต่างชาติเปิดสะสม Short ใหม่)"
-        flow_detail = f"ต่างชาติขายสุทธิ <code>{foreign_net:+,}</code> และ OI ขยาย <code>{delta_oi:+,}</code> สัญญา สะท้อนการเปิด Short เพิ่มเก็งขาลง"
-        flow_caution = f"แรงกดดันฝั่งขายสูง หากหลุด รับ 1 (<code>{sup_1:.0f}</code>) ดีลเลอร์จะเร่งขายตาม เสี่ยงไหลลงทดสอบ Lower 1-SD"
+        flow_detail = "ขายสุทธิพร้อม OI ขยายตัว สะท้อนการเปิด Short เพิ่มเก็งกำไรขาลง"
         action_strategy = "เน้นฝั่ง Short (Trend Expansion Down) ตามน้ำ ระวังการหลุดแนวรับแล้วรูดแรง"
-        long_plan = f"หลีกเลี่ยงการดักสวนรับเร็ว จนกว่าราคาจะแตะ รับ 2 (<code>{sup_2:.0f}</code>) หรือ Lower 1-SD แล้วเกิดสัญญาณหยุดลง"
-        short_plan = f"เด้งขึ้นทดสอบ ต้าน 1 (<code>{res_1:.0f}</code>) หรือ Max Pain (<code>{max_pain:.0f}</code>) ไม่ผ่าน เปิด Short เป้าหมาย <code>{sup_1:.0f}</code> และ <code>{lower_1sd:.1f}</code>"
+        long_plan = f"เลี่ยงดักสวนรับเร็ว จนกว่าราคาจะแตะ รับ 2 (<code>{sup_2:.0f}</code>) หรือ Lower 1-SD แล้วเกิดสัญญาณหยุดลง"
+        short_plan = f"เด้งชน ต้าน 1 (<code>{res_1:.0f}</code>) หรือ Max Pain (<code>{max_pain:.0f}</code>) ไม่ผ่าน เปิด Short เป้า <code>{sup_1:.0f}</code> และ <code>{lower_1sd:.1f}</code>"
         stop_loss_plan = f"ฝั่ง Short วาง Stop Loss เหนือ <code>{max(res_1 + 2.5, f_cost):.1f}</code> จุด"
     elif foreign_net < 0 and delta_oi < 0:
         flow_title = "Long Liquidation (ต่างชาติปิดลดพอร์ต Long)"
-        flow_detail = f"ต่างชาติขายสุทธิ <code>{foreign_net:+,}</code> ควบคู่กับ OI ลดลง <code>{delta_oi:+,}</code> สัญญา เป็นการปิดสัญญาลดความเสี่ยง"
-        flow_caution = f"ตลาดขาดแรงซื้อหนุน ตราบใดที่ยังไม่ยืนเหนือต้าน 1 (<code>{res_1:.0f}</code>) ให้ระวังการซึมลง"
+        flow_detail = "ขายสุทธิควบคู่ OI ลดลง เป็นการปิดสัญญาลดความเสี่ยง"
         action_strategy = "เทรดรอบสั้นอย่างระมัดระวัง เน้นตั้งรับต่ำและไม่ไล่ราคา"
-        long_plan = f"ดักซื้อบริเวณ รับ 1 (<code>{sup_1:.0f}</code>) หรือ Lower 1-SD (<code>{lower_1sd:.1f}</code>) เพื่อเล่นรีบาวด์สั้นๆ"
+        long_plan = f"ดักซื้อบริเวณ รับ 1 (<code>{sup_1:.0f}</code>) หรือ Lower 1-SD (<code>{lower_1sd:.1f}</code>) เล่นรีบาวด์สั้นๆ"
         short_plan = f"เด้งไม่ผ่าน ต้าน 1 (<code>{res_1:.0f}</code>) เปิด Short เล่นรอบย่อ"
         stop_loss_plan = f"ฝั่ง Long คัตเมื่อหลุด <code>{sup_1 - 2.0:.1f}</code> | ฝั่ง Short คัตเมื่อทะลุเหนือ <code>{res_2:.0f}</code>"
     else:
         flow_title = "Neutral / Rebalancing (ปรับสมดุลพอร์ต)"
-        flow_detail = f"ทิศทางฟันด์โฟลว์ยังไม่ชี้นำเด่นชัด (Foreign: <code>{foreign_net:+,}</code>, ΔOI: <code>{delta_oi:+,}</code>)"
-        flow_caution = "ตลาดเคลื่อนไหวตามกรอบเทคนิคและบรรยากาศภายนอก"
+        flow_detail = "ทิศทางฟันด์โฟลว์ยังไม่ชี้นำเด่นชัด เคลื่อนไหวตามกรอบเทคนิค"
         action_strategy = "เล่นในกรอบ รับ-ต้าน ตามปกติ"
         long_plan = f"รับแถว <code>{sup_1:.0f}</code> จุด"
         short_plan = f"ต้านแถว <code>{res_1:.0f}</code> จุด"
@@ -1248,16 +1411,37 @@ def generate_thai_trading_playbook(
     gamma_flip_str = f"{gamma_flip_val:.1f}" if not math.isnan(gamma_flip_val) else "N/A"
     if not math.isnan(gamma_flip_val) and abs(futures_ref - gamma_flip_val) <= 3.0:
         gamma_emoji = "⚖️"
-        gamma_zone_title = "Neutral / Transitional Gamma (ใกล้จุดเปลี่ยนโซน)"
-        gamma_desc_compact = f"ราคาประชิด Gamma Flip ({gamma_flip_val:.1f}) เป็นจุดหมุนความผันผวน ตลาดอยู่ในช่วงเปลี่ยนผ่าน เหมาะเทรดในกรอบ (Mean Reversion)"
+        gamma_zone_title = "Transitional Gamma (ใกล้จุดเปลี่ยนโซน)"
+        gamma_desc_compact = f"ราคาประชิด Gamma Flip ({gamma_flip_val:.1f}) เป็นจุดหมุนความผันผวน ตลาดอยู่ในช่วงเปลี่ยนผ่าน"
     elif is_positive_gamma:
         gamma_emoji = "🛡️"
         gamma_zone_title = "Positive Gamma (โซนลดความผันผวน / Mean Reversion)"
-        gamma_desc_compact = f"ราคาเหนือ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Long Gamma ซับแรงเหวี่ยง ช่วยพยุงการแกว่งตัวในกรอบ (Mean Reversion)"
+        gamma_desc_compact = f"ราคาเหนือ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Long Gamma ซับแรงเหวี่ยง พยุงตลาดแกว่งในกรอบ"
     else:
         gamma_emoji = "⚡"
         gamma_zone_title = "Negative Gamma (โซนเร่งความผันผวน / Trend Expansion)"
-        gamma_desc_compact = f"ราคาใต้ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Short Gamma หลุดรับจะเร่งแรงขาย ระวังความผันผวนขยายตัว (Trend Expansion)"
+        gamma_desc_compact = f"ราคาใต้ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Short Gamma หลุดรับจะเร่งแรงขาย ระวังผันผวนขยายตัว"
+
+    # Format Options Greeks & Skew Edge Block
+    greeks_edge_lines = []
+    if greeks_edge and greeks_edge.get("records_count", 0) > 0:
+        skew_val = greeks_edge.get("skew_25d", 0.0)
+        p_iv = greeks_edge.get("p_iv_pct", 0.0)
+        c_iv = greeks_edge.get("c_iv_pct", 0.0)
+        skew_desc = greeks_edge.get("skew_desc", "สมดุล")
+        be_move = greeks_edge.get("daily_breakeven_move", 0.0)
+        tg_ratio = greeks_edge.get("theta_gamma_ratio", 0.0)
+        d_vanna = greeks_edge.get("dealer_vanna", 0.0)
+        d_charm = greeks_edge.get("dealer_charm", 0.0)
+        vanna_desc = greeks_edge.get("vanna_bias_desc", "")
+        be_rule = "แกว่ง > ค่านี้เน้น Long / แคบกว่าเน้น Short รับ Theta"
+
+        greeks_edge_lines = [
+            f"• <b>Options Greeks & Skew Edge ({front_series}):</b>",
+            f"  - <b>25Δ Skew:</b> <code>{skew_val:+.2f}%</code> (Put <code>{p_iv:.1f}%</code> vs Call <code>{c_iv:.1f}%</code>) ➔ <i>{skew_desc}</i>",
+            f"  - <b>ATM Breakeven Move:</b> <code>{be_move:.1f}</code> จุด/วัน (θ/γ: <code>{tg_ratio:.1f}</code>) ➔ <i>{be_rule}</i>",
+            f"  - <b>Dealer Flow:</b> Vanna <code>{d_vanna:+,.0f}</code> สัญญา/1% IV | Charm <code>{d_charm:+,.0f}</code>/วัน ➔ <i>{vanna_desc}</i>"
+        ]
 
     # Format Intraday & Realized Volatility Block
     if intraday_rv and volume_profile and late_session:
@@ -1279,26 +1463,31 @@ def generate_thai_trading_playbook(
         late_session_desc = late_session.get("late_session_desc", "N/A")
 
         if is_valid_rv:
-            rv_section_line = f"• <b>Realized vs Implied Vol:</b> RV <code>{rv_ann * 100:.2f}%</code> vs ATM IV <code>{atm_iv * 100:.2f}%</code> ({bar_count} บาร์)\n  └ <i>สภาวะ: {vol_regime_desc}</i>"
+            rv_section_line = f"• <b>RV vs IV:</b> RV <code>{rv_ann * 100:.2f}%</code> vs ATM IV <code>{atm_iv * 100:.2f}%</code> ({bar_count} บาร์) ➔ <i>{vol_regime_desc}</i>"
         else:
-            rv_section_line = f"• <b>Realized Volatility (RV):</b> ⏳ <i>ข้อมูล Intraday วันล่าสุดไม่เต็มวัน (มี {bar_count}/325 บาร์) — งดคำนวณค่า RV เพื่อป้องกันตัวเลขคลาดเคลื่อน</i>"
+            rv_section_line = f"• <b>RV vs IV:</b> ⏳ <i>ข้อมูลไม่เต็มวัน ({bar_count}/325 บาร์) — งดคำนวณ RV</i>"
 
         if valid_days < 5:
-            profile_confluence_line = f"  - <i>⚠️ ข้อมูลสะสม {valid_days}/20 วัน (ยังไม่ครบ 5 วันทำการ — แสดงกรอบเบื้องต้นเท่านั้น ยังไม่ใช้อ้างอิงเป็นแนวรับ/ต้านคอนกรีต)</i>"
+            profile_line = f"• <b>Volume Profile:</b> POC <code>{poc:.0f}</code> | VA: <code>{val:.0f}</code>–<code>{vah:.0f}</code> (<i>⚠️ สะสม {valid_days}/20 วัน</i>)"
         else:
-            profile_confluence_line = f"  - <b>Confluence Zone:</b> {confluence_text}"
+            profile_line = f"• <b>Volume Profile:</b> POC <code>{poc:.0f}</code> | VA: <code>{val:.0f}</code>–<code>{vah:.0f}</code> ➔ <i>{confluence_text}</i>"
 
-        intraday_block = f"""📊 <b>3. โครงสร้าง Intraday & ความผันผวน (Warm-up: {valid_days}/20 วัน)</b>
-{rv_section_line}
-• <b>Intraday Volume Profile:</b>
-  - <b>POC:</b> <code>{poc:.0f}</code> จุด | <b>Value Area (70%):</b> <code>{val:.0f}</code> – <code>{vah:.0f}</code> จุด
-{profile_confluence_line}
-• <b>ช่วงท้ายตลาด (16:30–16:55 น.):</b>
-  - Futures: <code>{late_fut_delta:+.1f}</code> จุด | Basis ปิด: <code>{late_basis_close:+.2f}</code> (ΔBasis: <code>{late_basis_delta:+.2f}</code>)
-  - <i>บทสรุป: {late_session_desc}</i>
-"""
+        late_line = f"• <b>ท้ายตลาด (16:30–16:55):</b> Fut <code>{late_fut_delta:+.1f}</code> | Basis <code>{late_basis_close:+.2f}</code> (Δ<code>{late_basis_delta:+.2f}</code>) ➔ <i>{late_session_desc}</i>"
+
+        sec3_lines = [
+            f"📊 <b>3. โครงสร้างความผันผวน & Intraday (Warm-up: {valid_days}/20 วัน)</b>"
+        ]
+        if greeks_edge_lines:
+            sec3_lines.extend(greeks_edge_lines)
+        sec3_lines.append(rv_section_line)
+        sec3_lines.append(profile_line)
+        sec3_lines.append(late_line)
+        intraday_block = "\n".join(sec3_lines)
     else:
-        intraday_block = ""
+        if greeks_edge_lines:
+            intraday_block = f"📊 <b>3. โครงสร้าง Options Greeks ({front_series})</b>\n" + "\n".join(greeks_edge_lines)
+        else:
+            intraday_block = ""
 
     # Format Foreign Footprint
     if foreign_footprint:
@@ -1307,9 +1496,8 @@ def generate_thai_trading_playbook(
         f_z_desc = foreign_footprint.get("z_desc", "N/A")
         f_div_text = foreign_footprint.get("divergence_text", "N/A")
         f_days = foreign_footprint.get("history_days", 60)
-        foreign_footprint_block = f"""• <b>สถิติต่างชาติสะสม ({f_days} วันทำการ):</b>
-  - ยอดสะสม: <code>{f_cum:+,}</code> สัญญา | ต้นทุนเฉลี่ย: <code>{f_cost:.1f}</code> จุด <i>({f_pnl_status})</i>
-  - Flow Z-Score (20D): {f_z_desc} | Divergence: {f_div_text}"""
+        foreign_footprint_block = f"""• <b>ต่างชาติสะสม ({f_days}D):</b> <code>{f_cum:+,}</code> สัญญา | ทุนเฉลี่ย: <code>{f_cost:.1f}</code> จุด <i>({f_pnl_status})</i>
+  - Z-Score: {f_z_desc} | {f_div_text}"""
     else:
         foreign_footprint_block = ""
 
@@ -1319,26 +1507,23 @@ def generate_thai_trading_playbook(
         o_p_net = options_footprint.get("foreign_put_net", 0)
         top_c_k = options_footprint.get("top_call_strike")
         top_c_doi = options_footprint.get("top_call_doi", 0)
-        top_c_div = options_footprint.get("top_call_div", 0.0)
-        c_intent = options_footprint.get("call_intent", "ไม่มีการเปลี่ยนแปลง OI ที่มีนัยสำคัญ")
+        c_intent = options_footprint.get("call_intent", "ไม่มีนัยสำคัญ")
 
         top_p_k = options_footprint.get("top_put_strike")
         top_p_doi = options_footprint.get("top_put_doi", 0)
-        top_p_div = options_footprint.get("top_put_div", 0.0)
-        p_intent = options_footprint.get("put_intent", "ไม่มีการเปลี่ยนแปลง OI ที่มีนัยสำคัญ")
+        p_intent = options_footprint.get("put_intent", "ไม่มีนัยสำคัญ")
 
         if top_c_k is not None and top_c_doi > 0:
-            call_line = f"Call เด่น: Strike <code>{top_c_k:.0f}</code> (ΔOI: <code>{top_c_doi:+,}</code>, ΔIV: <code>{top_c_div:+.2f}%</code>) ➔ <i>{c_intent}</i>"
+            call_line = f"Call <code>{top_c_k:.0f}</code> (ΔOI: <code>{top_c_doi:+,}</code>) ➔ <i>{c_intent}</i>"
         else:
-            call_line = f"Call เด่น: <i>{c_intent}</i>"
+            call_line = f"Call: <i>{c_intent}</i>"
 
         if top_p_k is not None and top_p_doi > 0:
-            put_line = f"Put เด่น: Strike <code>{top_p_k:.0f}</code> (ΔOI: <code>{top_p_doi:+,}</code>, ΔIV: <code>{top_p_div:+.2f}%</code>) ➔ <i>{p_intent}</i>"
+            put_line = f"Put <code>{top_p_k:.0f}</code> (ΔOI: <code>{top_p_doi:+,}</code>) ➔ <i>{p_intent}</i>"
         else:
-            put_line = f"Put เด่น: <i>{p_intent}</i>"
+            put_line = f"Put: <i>{p_intent}</i>"
 
-        options_footprint_block = f"""• <b>Options Strike Footprint:</b>
-  - ต่างชาติ Options: Call <code>{o_c_net:+,}</code> | Put <code>{o_p_net:+,}</code> สัญญา
+        options_footprint_block = f"""• <b>Options Footprint:</b> Call <code>{o_c_net:+,}</code> | Put <code>{o_p_net:+,}</code> สัญญา
   - {call_line}
   - {put_line}"""
     else:
@@ -1350,21 +1535,21 @@ def generate_thai_trading_playbook(
         if cum_f < 0:
             if futures_ref < f_cost:
                 pnl = f_cost - futures_ref
-                cost_relation = f"ต่างชาติกำลังกำไรฝั่ง Short (+{pnl:.1f} จุด) แนว {f_cost:.1f} คือแนวต้านต้นทุน หากดีดไม่ผ่านระวังแรงกด Short ซ้ำ แต่หากทะลุยืนเหนือได้จะเกิดแรงซื้อคืน (Short Squeeze)"
+                cost_relation = f"ต่างชาติกำไร Short (+{pnl:.1f} จุด) แนว {f_cost:.1f} เป็นต้านต้นทุน ไม่ผ่านระวังแรงกดซ้ำ ทะลุระวัง Squeeze"
             else:
                 loss = futures_ref - f_cost
-                cost_relation = f"ต่างชาติติดลบฝั่ง Short (-{loss:.1f} จุด) ราคาอยู่เหนือแนวต้านต้นทุน ({f_cost:.1f}) ระวังเกิด Short Squeeze เร่งแรงดีดตัว"
+                cost_relation = f"ต่างชาติติดลบ Short (-{loss:.1f} จุด) เหนือแนวต้าน {f_cost:.1f} ระวัง Short Squeeze เร่งแรงดีด"
         elif cum_f > 0:
             if futures_ref >= f_cost:
                 pnl = futures_ref - f_cost
-                cost_relation = f"ต่างชาติกำไรฝั่ง Long (+{pnl:.1f} จุด) พร้อมรันเทรนด์ โดยระดับ {f_cost:.1f} ทำหน้าที่เป็นแนวรับจิตวิทยา (Defense Line)"
+                cost_relation = f"ต่างชาติกำไร Long (+{pnl:.1f} จุด) แนว {f_cost:.1f} เป็นแนวรับจิตวิทยา (Defense Line)"
             else:
                 loss = f_cost - futures_ref
-                cost_relation = f"ราคาอยู่ใต้ต้นทุนเฉลี่ยฝรั่ง ({f_cost:.1f}) ต่างชาติขาดทุนฝั่ง Long (-{loss:.1f} จุด) ระวังแรงขายตัดขาดทุนหรือแรงขายลดเสี่ยงเมื่อชนต้นทุน"
+                cost_relation = f"ต่ำกว่าทุนฝรั่ง ({f_cost:.1f}) ต่างชาติขาดทุน Long (-{loss:.1f} จุด) ระวังแรงขายลดเสี่ยงเมื่อชนทุน"
         else:
-            cost_relation = f"ต้นทุนเฉลี่ยฝรั่งอยู่ที่ {f_cost:.1f} จุด (สถานะสะสมใกล้เคียงศูนย์/เท่าทุน)"
+            cost_relation = f"ต้นทุนเฉลี่ยฝรั่ง {f_cost:.1f} จุด (สะสมใกล้เคียงศูนย์)"
 
-        cost_narrative = f"""• <b>แนวปะทะต้นทุนสถาบัน (Institutional Cost Line):</b> <code>{f_cost:.1f}</code> จุด
+        cost_narrative = f"""• <b>แนวปะทะต้นทุนสถาบัน (Cost Line):</b> <code>{f_cost:.1f}</code> จุด
   <i>({cost_relation})</i>
 """
     else:
@@ -1929,6 +2114,21 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
             "late_basis_delta": 0.45,
             "late_session_desc": "🟢 ต่างชาติซื้อ + ท้ายตลาดไล่ราคา Basis ขยับขึ้น ปิดใกล้ High มีโอกาสเปิดบวกต่อ"
         }
+        mock_greeks_edge = {
+            "skew_25d": 1.60,
+            "c_iv_pct": 12.4,
+            "p_iv_pct": 14.0,
+            "skew_desc": "ความกลัว-โลภสองฝั่งสมดุล (Normal)",
+            "atm_strike": 920.0,
+            "atm_gamma": 0.0035,
+            "atm_theta": 0.076,
+            "theta_gamma_ratio": 21.7,
+            "daily_breakeven_move": 6.6,
+            "dealer_vanna": -195.0,
+            "dealer_charm": 27.0,
+            "vanna_bias_desc": "หาก IV Crush ดีลเลอร์จะขาย Futures กดดันตลาด",
+            "records_count": 78
+        }
 
         html_file = build_interactive_dashboard(
             trade_date=t_0, futures_ref=futures_ref, front_series=front_series, next_series=next_series,
@@ -1952,7 +2152,8 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
             options_footprint=mock_options_footprint,
             intraday_rv=mock_intraday_rv,
             volume_profile=mock_volume_profile,
-            late_session=mock_late_session
+            late_session=mock_late_session,
+            greeks_edge=mock_greeks_edge
         )
 
         print("\n" + "=" * 75)
@@ -2385,6 +2586,20 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
     )
     print(f"[CHART] Interactive Plotly report generated: {html_file}")
 
+    # 8.1 Options Greeks & Skew Edge Analysis (Dealer Vanna/Charm, 25-Delta Skew, Breakeven Move)
+    print("[GREEKS EDGE] Analyzing Options Greeks, 25-Delta Skew, and Dealer Exposure...")
+    greeks_edge = analyze_options_greeks_edge(
+        pipeline_url=pipeline_url,
+        auth_token=turso_token,
+        trade_date=t_0,
+        front_series=front_series,
+        futures_ref=futures_ref,
+        thor_rate=thor_rate,
+        T_front=T_front,
+        front_opts_df=front_opts
+    )
+    print(f"[GREEKS EDGE] Skew 25Δ: {greeks_edge['skew_25d']:+.2f}% | ATM Breakeven: {greeks_edge['daily_breakeven_move']:.1f} pts | Dealer Vanna: {greeks_edge['dealer_vanna']:+,.0f}")
+
     # 9. Format Telegram Notification: Actionable Thai Trading Playbook
     now_bkk = datetime.datetime.now(BKK_TZ)
     as_of_time_bkk = now_bkk.strftime("%H:%M")
@@ -2417,7 +2632,8 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         options_footprint=options_footprint,
         intraday_rv=intraday_rv,
         volume_profile=volume_profile,
-        late_session=late_session
+        late_session=late_session,
+        greeks_edge=greeks_edge
     )
 
     # 10. Persist Log to Turso Database
