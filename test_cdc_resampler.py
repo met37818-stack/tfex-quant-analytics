@@ -3,7 +3,13 @@ Unit tests for CDC 1-minute resampler and Realized Volatility in pre_market_rada
 """
 import unittest
 import math
-from pre_market_radar import resample_cdc_to_1min_prices
+from unittest.mock import patch
+from pre_market_radar import (
+    resample_cdc_to_1min_prices,
+    select_dynamic_thor_rate,
+    compute_intraday_rv,
+    compute_volume_profile
+)
 
 
 class TestCDCResampler(unittest.TestCase):
@@ -57,6 +63,40 @@ class TestCDCResampler(unittest.TestCase):
         log_returns = [math.log(prices[i] / prices[i - 1]) for i in range(1, len(prices))]
         sum_sq = sum(r * r for r in log_returns)
         self.assertAlmostEqual(sum_sq, 0.0)
+
+    def test_dynamic_thor_rate_fail_loud(self):
+        empty_record = {"thor_overnight": None, "thor_1m": None, "thor_3m": None, "thor_6m": None}
+        with self.assertRaises(ValueError):
+            select_dynamic_thor_rate(empty_record, dte=30)
+
+    @patch("pre_market_radar.execute_turso_sql")
+    def test_compute_intraday_rv_insufficient_bars_returns_none(self, mock_sql):
+        # Return only 3 ticks (insufficient for 10 bars)
+        mock_sql.return_value = (None, [
+            ("2026-11-19 09:45:00", 920.0),
+            ("2026-11-19 09:46:00", 920.5),
+            ("2026-11-19 09:47:00", 921.0),
+        ])
+        # Note: resample_cdc_to_1min_prices on a full trade_date creates 325 grid points if start/end match,
+        # but if we pass empty rows, prices will be empty (< 10)
+        mock_sql.return_value = (None, [])
+        res = compute_intraday_rv("https://test", "token", "2026-11-19", "S50Z26", atm_iv=0.12)
+        self.assertIsNone(res["rv_annualized"])
+        self.assertFalse(res["is_valid_rv"])
+        self.assertIn("[INSUFFICIENT FUTURES DATA]", res["vol_regime_desc"])
+
+    @patch("pre_market_radar.execute_turso_sql")
+    def test_compute_volume_profile_insufficient_data_returns_none(self, mock_sql):
+        # No bar counts in database
+        mock_sql.return_value = (None, [])
+        res = compute_volume_profile(
+            "https://test", "token", "2026-11-19", "S50Z26",
+            tactical_levels={}, call_wall=940.0, put_wall=900.0, max_pain=920.0
+        )
+        self.assertIsNone(res["poc"])
+        self.assertIsNone(res["vah"])
+        self.assertIsNone(res["val"])
+        self.assertEqual(res["confluence_text"], "[NO INTRADAY VOLUME DATA]")
 
 
 if __name__ == "__main__":

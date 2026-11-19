@@ -178,7 +178,7 @@ def select_dynamic_thor_rate(
         if rate is not None and rate > 0:
             return rate, label
 
-    return 0.015, "DEFAULT"
+    raise ValueError(f"No valid THOR rate found in record: {thor_record}")
 
 
 def init_analytics_tables(pipeline_url: str, auth_token: str):
@@ -1030,31 +1030,24 @@ def compute_intraday_rv(
         _, rows_fut = execute_turso_sql(pipeline_url, auth_token, sql_fut, [front_series, f"{trade_date}%"])
         prices = resample_cdc_to_1min_prices(rows_fut, trade_date)
 
-        # Fallback to spot_snapshots if futures bars are insufficient
-        if len(prices) < 10:
-            sql_spot = """
-            SELECT captured_at_bkk, last 
-            FROM spot_snapshots 
-            WHERE symbol = 'SET50' AND captured_at_bkk LIKE ? AND last IS NOT NULL AND last > 0 
-            ORDER BY captured_at_bkk ASC;
-            """
-            _, rows_spot = execute_turso_sql(pipeline_url, auth_token, sql_spot, [f"{trade_date}%"])
-            if rows_spot:
-                prices = resample_cdc_to_1min_prices(rows_spot, trade_date)
-
         bar_count = len(prices)
+        if bar_count < 10:
+            return {
+                "rv_annualized": None,
+                "bar_count": bar_count,
+                "is_valid_rv": False,
+                "iv_rv_spread": None,
+                "vol_regime_desc": f"[INSUFFICIENT FUTURES DATA] มีเพียง {bar_count}/10 บาร์ (ต้องการอย่างน้อย 10 บาร์)"
+            }
+
         is_valid_rv = (bar_count >= 280)
-        if bar_count >= 5:
-            log_returns = [
-                math.log(prices[i] / prices[i - 1]) 
-                for i in range(1, bar_count) 
-                if prices[i] > 0 and prices[i - 1] > 0
-            ]
-            sum_sq = sum(r * r for r in log_returns)
-            rv_annualized = math.sqrt(252.0 * sum_sq)
-        else:
-            rv_annualized = atm_iv
-            bar_count = max(bar_count, 0)
+        log_returns = [
+            math.log(prices[i] / prices[i - 1]) 
+            for i in range(1, bar_count) 
+            if prices[i] > 0 and prices[i - 1] > 0
+        ]
+        sum_sq = sum(r * r for r in log_returns)
+        rv_annualized = math.sqrt(252.0 * sum_sq)
 
         # 2. Persist / UPSERT to daily_realized_vol
         upsert_sql = """
@@ -1064,31 +1057,35 @@ def compute_intraday_rv(
         execute_turso_sql(pipeline_url, auth_token, upsert_sql, [trade_date, rv_annualized, bar_count, updated_at_bkk])
 
         # 3. Compare RV vs ATM IV
-        spread = (atm_iv - rv_annualized) * 100.0
-        if not is_valid_rv:
-            vol_regime_desc = f"ข้อมูล Intraday วันล่าสุดไม่เต็มวัน (มี {bar_count}/325 บาร์) — งดคำนวณค่า RV เพื่อป้องกันตัวเลขคลาดเคลื่อน"
-        elif atm_iv > rv_annualized + 0.02:
-            vol_regime_desc = f"IV Premium สูง (Options แพงกว่าแกว่งจริง +{spread:.1f}% เหมาะเทรดในกรอบ)"
-        elif rv_annualized >= atm_iv:
-            vol_regime_desc = f"RV ทะลุ IV (ตลาดแกว่งจริงแรงกว่าคาดการณ์ {rv_annualized*100:.1f}% vs {atm_iv*100:.1f}% ระวัง Breakout)"
+        if atm_iv is not None and atm_iv > 0:
+            spread = (atm_iv - rv_annualized) * 100.0
+            if not is_valid_rv:
+                vol_regime_desc = f"ข้อมูล Intraday วันล่าสุดไม่เต็มวัน (มี {bar_count}/325 บาร์) — RV {rv_annualized*100:.2f}% (เพื่อการอ้างอิง)"
+            elif atm_iv > rv_annualized + 0.02:
+                vol_regime_desc = f"IV Premium สูง (Options แพงกว่าแกว่งจริง +{spread:.1f}% เหมาะเทรดในกรอบ)"
+            elif rv_annualized >= atm_iv:
+                vol_regime_desc = f"RV ทะลุ IV (ตลาดแกว่งจริงแรงกว่าคาดการณ์ {rv_annualized*100:.1f}% vs {atm_iv*100:.1f}% ระวัง Breakout)"
+            else:
+                vol_regime_desc = f"สมดุล (IV {atm_iv*100:.1f}% สอดคล้องกับ RV {rv_annualized*100:.1f}%)"
         else:
-            vol_regime_desc = f"สมดุล (IV {atm_iv*100:.1f}% สอดคล้องกับ RV {rv_annualized*100:.1f}%)"
+            spread = None
+            vol_regime_desc = f"RV คำนวณได้ {rv_annualized*100:.2f}% ({bar_count} บาร์) แต่ไม่มีค่า ATM IV เปรียบเทียบ"
 
         return {
             "rv_annualized": float(rv_annualized),
             "bar_count": bar_count,
             "is_valid_rv": is_valid_rv,
-            "iv_rv_spread": float(spread),
+            "iv_rv_spread": float(spread) if spread is not None else None,
             "vol_regime_desc": vol_regime_desc
         }
     except Exception as e:
         print(f"[RV] Warning: compute_intraday_rv failed: {e}")
         return {
-            "rv_annualized": float(atm_iv),
+            "rv_annualized": None,
             "bar_count": 0,
             "is_valid_rv": False,
-            "iv_rv_spread": 0.0,
-            "vol_regime_desc": "ข้อมูล Intraday ไม่เพียงพอ (มี 0/325 บาร์)"
+            "iv_rv_spread": None,
+            "vol_regime_desc": "[INSUFFICIENT FUTURES DATA] ไม่สามารถดึงข้อมูลได้"
         }
 
 def compute_volume_profile(
@@ -1135,12 +1132,12 @@ def compute_volume_profile(
 
         if warmup_days == 0:
             return {
-                "poc": max_pain,
-                "vah": max_pain + 5.0,
-                "val": max_pain - 5.0,
+                "poc": None,
+                "vah": None,
+                "val": None,
                 "warmup_days": 0,
                 "valid_days": 0,
-                "confluence_text": "กำลังสะสมข้อมูล Intraday (ยังไม่มีบาร์ในระบบ)"
+                "confluence_text": "[NO INTRADAY VOLUME DATA]"
             }
 
         sorted_counts = sorted(rows_counts, key=lambda x: x[0])
@@ -1156,13 +1153,14 @@ def compute_volume_profile(
         """
         _, rows_bars = execute_turso_sql(pipeline_url, auth_token, sql_bars, [front_series, min_date, max_date])
 
-        if not rows_bars:
+        if not rows_bars or len(rows_bars) < 10:
             return {
-                "poc": max_pain,
-                "vah": max_pain + 5.0,
-                "val": max_pain - 5.0,
+                "poc": None,
+                "vah": None,
+                "val": None,
                 "warmup_days": warmup_days,
-                "confluence_text": "กำลังสะสมข้อมูล Intraday"
+                "valid_days": valid_days,
+                "confluence_text": "[NO INTRADAY VOLUME DATA]"
             }
 
         # 3. Aggregate volume by price
@@ -1193,13 +1191,15 @@ def compute_volume_profile(
             k = round(px)
             vol_by_price[k] = vol_by_price.get(k, 0.0) + max(1.0, delta_v)
 
-        if not vol_by_price:
+        total_v = sum(vol_by_price.values()) if vol_by_price else 0.0
+        if not vol_by_price or total_v <= 0:
             return {
-                "poc": max_pain,
-                "vah": max_pain + 5.0,
-                "val": max_pain - 5.0,
+                "poc": None,
+                "vah": None,
+                "val": None,
                 "warmup_days": warmup_days,
-                "confluence_text": "กำลังสะสมข้อมูล Intraday"
+                "valid_days": valid_days,
+                "confluence_text": "[NO INTRADAY VOLUME DATA]"
             }
 
         total_v = sum(vol_by_price.values())
@@ -1263,12 +1263,12 @@ def compute_volume_profile(
     except Exception as e:
         print(f"[VOL_PROFILE] Warning: compute_volume_profile failed: {e}")
         return {
-            "poc": max_pain,
-            "vah": max_pain + 5.0,
-            "val": max_pain - 5.0,
+            "poc": None,
+            "vah": None,
+            "val": None,
             "warmup_days": 0,
             "valid_days": 0,
-            "confluence_text": "ข้อมูล Volume Profile ไม่เพียงพอ"
+            "confluence_text": "[NO INTRADAY VOLUME DATA]"
         }
 
 def analyze_late_session_flow(
@@ -1395,7 +1395,8 @@ def fetch_volatility_time_series(
         print(f"[VOL_SERIES] Note: fetch daily_realized_vol: {e}")
 
     # Add or update current session
-    iv_map[current_date] = float(current_atm_iv)
+    if current_atm_iv is not None:
+        iv_map[current_date] = float(current_atm_iv)
     if is_valid_rv and current_rv is not None:
         rv_map[current_date] = float(current_rv)
 
@@ -1464,12 +1465,21 @@ def generate_thai_trading_playbook(
     sup_2_oi = tactical_levels["sup_2_oi"]
 
     # 1. IV interpretation
-    if atm_iv < 0.10:
-        iv_desc = "ความผันผวนต่ำมาก ตลาดมักบีบกรอบแคบ"
-    elif atm_iv <= 0.15:
-        iv_desc = "ความผันผวนปกติ เหมาะเทรดในกรอบ"
+    if atm_iv is not None and atm_iv > 0:
+        if atm_iv < 0.10:
+            iv_desc = "ความผันผวนต่ำมาก ตลาดมักบีบกรอบแคบ"
+        elif atm_iv <= 0.15:
+            iv_desc = "ความผันผวนปกติ เหมาะเทรดในกรอบ"
+        else:
+            iv_desc = "ความผันผวนสูง แกว่งกว้าง ควรกระชับจุดคัต"
+        atm_iv_text = f"<code>{atm_iv * 100:.2f}%</code> <i>({iv_desc})</i>"
     else:
-        iv_desc = "ความผันผวนสูง แกว่งกว้าง ควรกระชับจุดคัต"
+        atm_iv_text = "<i>[UNAVAILABLE - ข้อมูลราคา Options ไม่เพียงพอ]</i>"
+
+    if expected_move_1d is not None and upper_1sd is not None and lower_1sd is not None:
+        expected_move_text = f"<code>{lower_1sd:.1f}</code> – <code>{upper_1sd:.1f}</code> จุด <i>(ระยะแกว่ง ±{expected_move_1d:.1f} จุด)</i>"
+    else:
+        expected_move_text = "<i>[UNAVAILABLE - ข้อมูลราคา Options ไม่เพียงพอ]</i>"
 
     f_cost = foreign_footprint.get("cost_basis", futures_ref) if foreign_footprint else futures_ref
 
@@ -1547,14 +1557,14 @@ def generate_thai_trading_playbook(
 
     # Format Intraday & Realized Volatility Block
     if intraday_rv and volume_profile and late_session:
-        rv_ann = intraday_rv.get("rv_annualized", atm_iv)
+        rv_ann = intraday_rv.get("rv_annualized")
         bar_count = intraday_rv.get("bar_count", 0)
         is_valid_rv = intraday_rv.get("is_valid_rv", bar_count >= 280)
         vol_regime_desc = intraday_rv.get("vol_regime_desc", "N/A")
 
-        poc = volume_profile.get("poc", futures_ref)
-        vah = volume_profile.get("vah", futures_ref + 5)
-        val = volume_profile.get("val", futures_ref - 5)
+        poc = volume_profile.get("poc")
+        vah = volume_profile.get("vah")
+        val = volume_profile.get("val")
         warmup_days = volume_profile.get("warmup_days", 0)
         valid_days = volume_profile.get("valid_days", 0)
         confluence_text = volume_profile.get("confluence_text", "N/A")
@@ -1564,12 +1574,17 @@ def generate_thai_trading_playbook(
         late_basis_delta = late_session.get("late_basis_delta", 0.0)
         late_session_desc = late_session.get("late_session_desc", "N/A")
 
-        if is_valid_rv:
-            rv_section_line = f"• <b>RV vs IV:</b> RV <code>{rv_ann * 100:.2f}%</code> vs ATM IV <code>{atm_iv * 100:.2f}%</code> ({bar_count} บาร์) ➔ <i>{vol_regime_desc}</i>"
+        if rv_ann is not None:
+            if atm_iv is not None:
+                rv_section_line = f"• <b>RV vs IV:</b> RV <code>{rv_ann * 100:.2f}%</code> vs ATM IV <code>{atm_iv * 100:.2f}%</code> ({bar_count} บาร์) ➔ <i>{vol_regime_desc}</i>"
+            else:
+                rv_section_line = f"• <b>RV vs IV:</b> RV <code>{rv_ann * 100:.2f}%</code> ({bar_count} บาร์) ➔ <i>{vol_regime_desc}</i>"
         else:
-            rv_section_line = f"• <b>RV vs IV:</b> ⏳ <i>ข้อมูลไม่เต็มวัน ({bar_count}/325 บาร์) — งดคำนวณ RV</i>"
+            rv_section_line = f"• <b>RV vs IV:</b> ⏳ <i>[INSUFFICIENT FUTURES DATA] ({bar_count}/10 บาร์) — งดคำนวณ RV</i>"
 
-        if valid_days < 5:
+        if poc is None or vah is None or val is None:
+            profile_line = f"• <b>Volume Profile:</b> <i>[NO INTRADAY VOLUME DATA]</i>"
+        elif valid_days < 5:
             profile_line = f"• <b>Volume Profile:</b> POC <code>{poc:.0f}</code> | VA: <code>{val:.0f}</code>–<code>{vah:.0f}</code> (<i>⚠️ สะสม {valid_days}/20 วัน</i>)"
         else:
             profile_line = f"• <b>Volume Profile:</b> POC <code>{poc:.0f}</code> | VA: <code>{val:.0f}</code>–<code>{vah:.0f}</code> ➔ <i>{confluence_text}</i>"
@@ -1681,8 +1696,8 @@ def generate_thai_trading_playbook(
 📅 <i>ข้อมูลสิ้นวัน {trade_date} | ออกรายงานเช้า {as_of_time_bkk} น.</i>
 ━━━━━━━━━━━━━━━━━━━━━━
 🎯 <b>1. กรอบวิ่งคาดการณ์ (1-Day Expected Move)</b>
-• <b>กรอบราคา 1-SD:</b> <code>{lower_1sd:.1f}</code> – <code>{upper_1sd:.1f}</code> จุด <i>(ระยะแกว่ง ±{expected_move_1d:.1f} จุด)</i>
-• <b>ระดับความผันผวน (ATM IV):</b> <code>{atm_iv * 100:.2f}%</code> <i>({iv_desc})</i>
+• <b>กรอบราคา 1-SD:</b> {expected_move_text}
+• <b>ระดับความผันผวน (ATM IV):</b> {atm_iv_text}
 
 🧱 <b>2. แนวรับ - แนวต้านสำคัญ (Tactical Key Levels)</b>
 🔴 <b>ต้าน 2:</b> <code>{res_2:.0f}</code> <i>({res_2_oi:,})</i> | <b>ต้าน 1:</b> <code>{res_1:.0f}</code> <i>({res_1_oi:,})</i>
@@ -2416,15 +2431,21 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         atm_iv = float(atm_records["iv"].mean())
     else:
         valid_ivs = front_opts[front_opts["iv"].notnull()]["iv"]
-        atm_iv = float(valid_ivs.mean()) if not valid_ivs.empty else 0.12
+        atm_iv = float(valid_ivs.mean()) if not valid_ivs.empty else None
 
     # 5.1 Calculate 1-Day Expected Move (1-SD)
-    expected_move_1d = futures_ref * (atm_iv / math.sqrt(252.0))
-    upper_1sd = futures_ref + expected_move_1d
-    lower_1sd = futures_ref - expected_move_1d
+    if atm_iv is not None and atm_iv > 0:
+        expected_move_1d = futures_ref * (atm_iv / math.sqrt(252.0))
+        upper_1sd = futures_ref + expected_move_1d
+        lower_1sd = futures_ref - expected_move_1d
+    else:
+        expected_move_1d = None
+        upper_1sd = None
+        lower_1sd = None
 
     # 6. Strike-Level GEX Profile, Walls, and Max Pain
     gex_records = []
+    skipped_gex_strikes = 0
     for k in strikes_front:
         c_item = front_opts[(front_opts["strike"] == k) & (front_opts["option_type"] == "C")]
         p_item = front_opts[(front_opts["strike"] == k) & (front_opts["option_type"] == "P")]
@@ -2436,7 +2457,10 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         p_iv = p_item["iv"].values[0] if len(p_item) else None
 
         valid_k_ivs = [x for x in [c_iv, p_iv] if x is not None and not np.isnan(x)]
-        sigma_k = np.mean(valid_k_ivs) if valid_k_ivs else atm_iv
+        if not valid_k_ivs:
+            skipped_gex_strikes += 1
+            continue
+        sigma_k = float(np.mean(valid_k_ivs))
 
         greeks = calculate_black76_greeks(futures_ref, k, T_front, r_rf, sigma_k, "C")
         gamma_k = greeks["gamma"]
@@ -2532,8 +2556,14 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
     # 6.1 Resolve Nearest Tactical Levels (Spot ± 25)
     tactical_levels = resolve_tactical_levels(res_df, futures_ref, call_wall, put_wall)
 
-    print(f"[QUANT] ATM IV            : {atm_iv * 100.0:.2f}% (ATM Strike: {atm_strike:.0f})")
-    print(f"[QUANT] 1-Day Expected Move: ±{expected_move_1d:.1f} pts (Range: {lower_1sd:.1f} - {upper_1sd:.1f})")
+    if atm_iv is not None:
+        print(f"[QUANT] ATM IV            : {atm_iv * 100.0:.2f}% (ATM Strike: {atm_strike:.0f})")
+    else:
+        print(f"[QUANT] ATM IV            : [UNAVAILABLE] (ATM Strike: {atm_strike:.0f})")
+    if expected_move_1d is not None:
+        print(f"[QUANT] 1-Day Expected Move: ±{expected_move_1d:.1f} pts (Range: {lower_1sd:.1f} - {upper_1sd:.1f})")
+    else:
+        print(f"[QUANT] 1-Day Expected Move: [UNAVAILABLE]")
     print(f"[QUANT] Tactical Levels   : Sup2={tactical_levels['sup_2']:.0f}, Sup1={tactical_levels['sup_1']:.0f} | Res1={tactical_levels['res_1']:.0f}, Res2={tactical_levels['res_2']:.0f}")
     print(f"[QUANT] Call Wall         : {call_wall:.0f} (OI: {int(res_df.loc[res_df['strike'] == call_wall, 'call_oi'].values[0]):,})")
     print(f"[QUANT] Put Wall          : {put_wall:.0f} (OI: {int(res_df.loc[res_df['strike'] == put_wall, 'put_oi'].values[0]):,})")
@@ -2641,7 +2671,10 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         front_series=front_series,
         atm_iv=atm_iv
     )
-    print(f"[INTRADAY] Realized Vol: {intraday_rv['rv_annualized']*100:.2f}% (Bars: {intraday_rv['bar_count']}) vs ATM IV: {atm_iv*100:.2f}% | Spread: {intraday_rv['iv_rv_spread']:+.2f}%")
+    rv_disp = f"{intraday_rv['rv_annualized']*100:.2f}%" if intraday_rv.get('rv_annualized') is not None else "[INSUFFICIENT DATA]"
+    iv_disp = f"{atm_iv*100:.2f}%" if atm_iv is not None else "[UNAVAILABLE]"
+    spread_disp = f"{intraday_rv['iv_rv_spread']:+.2f}%" if intraday_rv.get('iv_rv_spread') is not None else "N/A"
+    print(f"[INTRADAY] Realized Vol: {rv_disp} (Bars: {intraday_rv['bar_count']}) vs ATM IV: {iv_disp} | Spread: {spread_disp}")
 
     vol_time_series = fetch_volatility_time_series(
         pipeline_url=pipeline_url,
