@@ -27,6 +27,7 @@ import pandas as pd
 from scipy.stats import norm
 from scipy.optimize import brentq
 from dotenv import load_dotenv
+from typing import List, Dict, Any, Optional, Tuple, Set
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -950,6 +951,59 @@ def analyze_options_footprint(
 # INTRADAY WARM-UP ANALYTICS (REALIZED VOLATILITY, VOLUME PROFILE, LATE SESSION)
 # ==============================================================================
 
+def resample_cdc_to_1min_prices(raw_rows: List[Any], trade_date: str) -> List[float]:
+    """
+    Resamples irregular CDC ticks into continuous 1-minute bars using forward fill (ffill).
+    Generates standard 325-minute TFEX trading grid (09:45-12:30, 14:15-16:55)
+    to prevent Realized Volatility (RV) distortion from irregular event capture.
+    """
+    if not raw_rows:
+        return []
+
+    # Map observed last price to minute buckets (last tick of that minute)
+    observed_by_minute: Dict[str, float] = {}
+    for r in raw_rows:
+        ts_str = str(r[0])
+        px = float(r[1]) if (r[1] is not None and float(r[1]) > 0) else None
+        if px is not None:
+            m_k = ts_str[:16] + ":00" if len(ts_str) >= 16 else ts_str
+            # Clamp session close snapshots (12:30 -> 12:29, 16:55 -> 16:54) to bar grid
+            if m_k == f"{trade_date} 12:30:00":
+                m_k = f"{trade_date} 12:29:00"
+            elif m_k == f"{trade_date} 16:55:00":
+                m_k = f"{trade_date} 16:54:00"
+            observed_by_minute[m_k] = px
+
+    if not observed_by_minute:
+        return []
+
+    # Generate TFEX regular 1-minute grid (exactly 325 bars: 165 morning + 160 afternoon)
+    grid = []
+    # Morning: 09:45:00 to 12:29:00 (165 bars)
+    cur = datetime.datetime.strptime(f"{trade_date} 09:45:00", "%Y-%m-%d %H:%M:%S")
+    end_m = datetime.datetime.strptime(f"{trade_date} 12:30:00", "%Y-%m-%d %H:%M:%S")
+    while cur < end_m:
+        grid.append(cur.strftime("%Y-%m-%d %H:%M:00"))
+        cur += datetime.timedelta(minutes=1)
+    # Afternoon: 14:15:00 to 16:54:00 (160 bars)
+    cur = datetime.datetime.strptime(f"{trade_date} 14:15:00", "%Y-%m-%d %H:%M:%S")
+    end_a = datetime.datetime.strptime(f"{trade_date} 16:55:00", "%Y-%m-%d %H:%M:%S")
+    while cur < end_a:
+        grid.append(cur.strftime("%Y-%m-%d %H:%M:00"))
+        cur += datetime.timedelta(minutes=1)
+
+    # Forward fill prices across the continuous 325-minute grid
+    resampled_prices: List[float] = []
+    last_known = None
+    for m_ts in grid:
+        if m_ts in observed_by_minute:
+            last_known = observed_by_minute[m_ts]
+        if last_known is not None:
+            resampled_prices.append(last_known)
+
+    return resampled_prices
+
+
 def compute_intraday_rv(
     pipeline_url: str,
     auth_token: str,
@@ -974,7 +1028,7 @@ def compute_intraday_rv(
         ORDER BY captured_at_bkk ASC;
         """
         _, rows_fut = execute_turso_sql(pipeline_url, auth_token, sql_fut, [front_series, f"{trade_date}%"])
-        prices = [float(r[1]) for r in rows_fut if r[1] is not None]
+        prices = resample_cdc_to_1min_prices(rows_fut, trade_date)
 
         # Fallback to spot_snapshots if futures bars are insufficient
         if len(prices) < 10:
@@ -986,7 +1040,7 @@ def compute_intraday_rv(
             """
             _, rows_spot = execute_turso_sql(pipeline_url, auth_token, sql_spot, [f"{trade_date}%"])
             if rows_spot:
-                prices = [float(r[1]) for r in rows_spot if r[1] is not None]
+                prices = resample_cdc_to_1min_prices(rows_spot, trade_date)
 
         bar_count = len(prices)
         is_valid_rv = (bar_count >= 280)
@@ -1056,7 +1110,7 @@ def compute_volume_profile(
     try:
         # 1. Fetch available trade dates and bar counts in futures_snapshots (up to lookback_days)
         sql_counts = """
-        SELECT SUBSTR(captured_at_bkk, 1, 10) as dt, COUNT(*) as cnt 
+        SELECT SUBSTR(captured_at_bkk, 1, 10) as dt, COUNT(DISTINCT SUBSTR(captured_at_bkk, 1, 16)) as cnt 
         FROM futures_snapshots 
         WHERE captured_at_bkk <= ? AND symbol = ?
         GROUP BY dt
@@ -1067,7 +1121,7 @@ def compute_volume_profile(
 
         if not rows_counts:
             sql_counts_all = """
-            SELECT SUBSTR(captured_at_bkk, 1, 10) as dt, COUNT(*) as cnt 
+            SELECT SUBSTR(captured_at_bkk, 1, 10) as dt, COUNT(DISTINCT SUBSTR(captured_at_bkk, 1, 16)) as cnt 
             FROM futures_snapshots 
             WHERE captured_at_bkk <= ? 
             GROUP BY dt
