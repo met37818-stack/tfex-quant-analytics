@@ -28,13 +28,13 @@ class TestCDCResampler(unittest.TestCase):
             ("2026-11-19 09:47:12", 921.0),
             ("2026-11-19 09:47:45", 921.2),
             ("2026-11-19 12:30:00", 925.0),
-            ("2026-11-19 14:15:00", 926.0),
+            ("2026-11-19 13:45:00", 926.0),
             ("2026-11-19 16:55:00", 930.0),
         ]
 
         prices = resample_cdc_to_1min_prices(raw_rows, trade_date)
-        # Standard grid has 165 morning bars + 160 afternoon bars = 325 bars
-        self.assertEqual(len(prices), 325)
+        # Standard grid has 165 morning bars + 190 afternoon bars = 355 bars
+        self.assertEqual(len(prices), 355)
 
         # Bar 0 (09:45): 920.5 (last tick of 09:45)
         self.assertEqual(prices[0], 920.5)
@@ -44,10 +44,10 @@ class TestCDCResampler(unittest.TestCase):
         self.assertEqual(prices[2], 921.2)
         # Bar 164 (12:29 / 12:30 close snapshot): 925.0
         self.assertEqual(prices[164], 925.0)
-        # Bar 165 (14:15): 926.0
+        # Bar 165 (13:45): 926.0
         self.assertEqual(prices[165], 926.0)
-        # Bar 324 (16:54 / 16:55 close snapshot): 930.0
-        self.assertEqual(prices[324], 930.0)
+        # Bar 354 (16:54 / 16:55 close snapshot): 930.0
+        self.assertEqual(prices[354], 930.0)
 
     def test_quiet_minutes_zero_log_returns(self):
         trade_date = "2026-11-19"
@@ -57,7 +57,7 @@ class TestCDCResampler(unittest.TestCase):
             ("2026-11-19 16:55:00", 920.0),
         ]
         prices = resample_cdc_to_1min_prices(raw_rows, trade_date)
-        self.assertEqual(len(prices), 325)
+        self.assertEqual(len(prices), 355)
         
         # All returns must be exactly 0
         log_returns = [math.log(prices[i] / prices[i - 1]) for i in range(1, len(prices))]

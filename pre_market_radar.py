@@ -954,7 +954,7 @@ def analyze_options_footprint(
 def resample_cdc_to_1min_prices(raw_rows: List[Any], trade_date: str) -> List[float]:
     """
     Resamples irregular CDC ticks into continuous 1-minute bars using forward fill (ffill).
-    Generates standard 325-minute TFEX trading grid (09:45-12:30, 14:15-16:55)
+    Generates standard 355-minute TFEX trading grid (09:45-12:30, 13:45-16:55)
     to prevent Realized Volatility (RV) distortion from irregular event capture.
     """
     if not raw_rows:
@@ -977,7 +977,7 @@ def resample_cdc_to_1min_prices(raw_rows: List[Any], trade_date: str) -> List[fl
     if not observed_by_minute:
         return []
 
-    # Generate TFEX regular 1-minute grid (exactly 325 bars: 165 morning + 160 afternoon)
+    # Generate TFEX regular 1-minute grid (exactly 355 bars: 165 morning + 190 afternoon)
     grid = []
     # Morning: 09:45:00 to 12:29:00 (165 bars)
     cur = datetime.datetime.strptime(f"{trade_date} 09:45:00", "%Y-%m-%d %H:%M:%S")
@@ -985,14 +985,14 @@ def resample_cdc_to_1min_prices(raw_rows: List[Any], trade_date: str) -> List[fl
     while cur < end_m:
         grid.append(cur.strftime("%Y-%m-%d %H:%M:00"))
         cur += datetime.timedelta(minutes=1)
-    # Afternoon: 14:15:00 to 16:54:00 (160 bars)
-    cur = datetime.datetime.strptime(f"{trade_date} 14:15:00", "%Y-%m-%d %H:%M:%S")
+    # Afternoon: 13:45:00 to 16:54:00 (190 bars)
+    cur = datetime.datetime.strptime(f"{trade_date} 13:45:00", "%Y-%m-%d %H:%M:%S")
     end_a = datetime.datetime.strptime(f"{trade_date} 16:55:00", "%Y-%m-%d %H:%M:%S")
     while cur < end_a:
         grid.append(cur.strftime("%Y-%m-%d %H:%M:00"))
         cur += datetime.timedelta(minutes=1)
 
-    # Forward fill prices across the continuous 325-minute grid
+    # Forward fill prices across the continuous 355-minute grid
     resampled_prices: List[float] = []
     last_known = None
     for m_ts in grid:
@@ -1040,7 +1040,7 @@ def compute_intraday_rv(
                 "vol_regime_desc": f"[INSUFFICIENT FUTURES DATA] มีเพียง {bar_count}/10 บาร์ (ต้องการอย่างน้อย 10 บาร์)"
             }
 
-        is_valid_rv = (bar_count >= 280)
+        is_valid_rv = (bar_count >= 310)
         log_returns = [
             math.log(prices[i] / prices[i - 1]) 
             for i in range(1, bar_count) 
@@ -1060,7 +1060,7 @@ def compute_intraday_rv(
         if atm_iv is not None and atm_iv > 0:
             spread = (atm_iv - rv_annualized) * 100.0
             if not is_valid_rv:
-                vol_regime_desc = f"ข้อมูล Intraday วันล่าสุดไม่เต็มวัน (มี {bar_count}/325 บาร์) — RV {rv_annualized*100:.2f}% (เพื่อการอ้างอิง)"
+                vol_regime_desc = f"ข้อมูล Intraday วันล่าสุดไม่เต็มวัน (มี {bar_count}/355 บาร์) — RV {rv_annualized*100:.2f}% (เพื่อการอ้างอิง)"
             elif atm_iv > rv_annualized + 0.02:
                 vol_regime_desc = f"IV Premium สูง (Options แพงกว่าแกว่งจริง +{spread:.1f}% เหมาะเทรดในกรอบ)"
             elif rv_annualized >= atm_iv:
@@ -1128,7 +1128,7 @@ def compute_volume_profile(
             _, rows_counts = execute_turso_sql(pipeline_url, auth_token, sql_counts_all, [f"{target_date} 23:59:59", lookback_days])
 
         warmup_days = len(rows_counts)
-        valid_days = len([r for r in rows_counts if int(r[1] or 0) >= 280])
+        valid_days = len([r for r in rows_counts if int(r[1] or 0) >= 310])
 
         if warmup_days == 0:
             return {
@@ -1359,7 +1359,7 @@ def fetch_volatility_time_series(
     lookback_days: int = 60
 ) -> list[dict]:
     """
-    Fetches historical ATM IV (from analytics_premarket_log) and valid Daily RV (bar_count >= 280 from daily_realized_vol).
+    Fetches historical ATM IV (from analytics_premarket_log) and valid Daily RV (bar_count >= 310 from daily_realized_vol).
     Merges with current session's data for the Volatility Regime Time-Series chart.
     """
     iv_map = {}
@@ -1383,7 +1383,7 @@ def fetch_volatility_time_series(
         sql_rv = """
         SELECT trade_date, rv_annualized, bar_count 
         FROM daily_realized_vol 
-        WHERE bar_count >= 280 AND trade_date <= ? 
+        WHERE bar_count >= 310 AND trade_date <= ? 
         ORDER BY trade_date ASC 
         LIMIT ?;
         """
@@ -1559,7 +1559,7 @@ def generate_thai_trading_playbook(
     if intraday_rv and volume_profile and late_session:
         rv_ann = intraday_rv.get("rv_annualized")
         bar_count = intraday_rv.get("bar_count", 0)
-        is_valid_rv = intraday_rv.get("is_valid_rv", bar_count >= 280)
+        is_valid_rv = intraday_rv.get("is_valid_rv", bar_count >= 310)
         vol_regime_desc = intraday_rv.get("vol_regime_desc", "N/A")
 
         poc = volume_profile.get("poc")
@@ -1834,7 +1834,7 @@ def build_interactive_dashboard(
         fig.add_trace(
             go.Scatter(
                 x=v_dates, y=v_rv,
-                mode="lines+markers", name="Daily RV (%) [≥280 bars]",
+                mode="lines+markers", name="Daily RV (%) [≥310 bars]",
                 line=dict(color="#00E676", width=2),
                 marker=dict(size=6, symbol="diamond"),
                 connectgaps=False,
