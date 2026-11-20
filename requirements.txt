@@ -1,6 +1,10 @@
-numpy>=1.24.0
-scipy>=1.10.0
-pandas>=2.0.0
-plotly>=5.15.0
-requests>=2.28.0
-python-dotenv>=1.0.0
+# Pinned for reproducibility — resolved on CPython 3.11 (the interpreter used by
+# .github/workflows/premarket_radar.yml). Loose `>=` bounds pulled different
+# numpy/pandas builds on every run, so the IV solver and the pandas-based volume
+# profile could change behaviour without a code change.
+numpy==2.4.6
+scipy==1.17.1
+pandas==3.1.1
+plotly==7.1.0
+requests==2.34.2
+python-dotenv==1.2.4

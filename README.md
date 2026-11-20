@@ -102,16 +102,31 @@
 
 1. **ติดตั้ง Dependencies:**
    ```bash
-   pip install -r requirements.txt
+   pip install -r requirements.txt      # pin ไว้แล้ว (resolve บน Python 3.11)
    ```
 
-2. **ทดสอบรันด้วยชุดข้อมูลจำลอง (Mock Test Mode):**
+2. **รันชุดทดสอบ (unit tests):**
+   ```bash
+   pip install -r requirements-dev.txt  # requirements.txt + pytest
+   python -m pytest -q                  # คาดหวัง 22 passed
+   ```
+
+3. **ทดสอบรันด้วยชุดข้อมูลจำลอง (Mock Test Mode):**
    ```bash
    python pre_market_radar.py --test
    ```
-   *(โหมดนี้จะคำนวณและแสดงผลตัวอย่างรายงานแผนเทรดภาษาไทยบนหน้าจอ และหากมีการตั้งค่า TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID จะส่งเข้า Telegram ให้ทันที)*
+   *(โหมดนี้จะคำนวณและแสดงผลตัวอย่างรายงานแผนเทรดภาษาไทยบนหน้าจอ และหากมีการตั้งค่า TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID จะส่งเข้า Telegram ให้ทันที — ตั้งแต่รอบ review 2026-11-22 โหมด `--test` ทำหน้าที่เป็น **smoke test**: ถ้าผลลัพธ์ขาดส่วนสำคัญหรือไม่ได้เขียน dashboard จะ `exit 1`)*
 
-3. **รันจริงเชื่อมต่อฐานข้อมูล Turso:**
+4. **รันจริงเชื่อมต่อฐานข้อมูล Turso:**
    ```bash
    python pre_market_radar.py --force
    ```
+
+---
+
+## ⚠️ ข้อกำหนดด้านข้อมูล (Fail-Loud Rules)
+
+- **THOR ต้องเป็น percent p.a. เท่านั้น** — ระบบหาร 100 แบบไม่มีเงื่อนไข (เดิมเดาจากขนาด ทำให้ THOR 0.45% อ่านเป็น 45% แล้ว IV ที่แก้ได้เพี้ยนไปหลาย vol point) และจะ `raise` ถ้าค่าเกิน `THOR_MAX_PCT = 25.0`
+- **ห้ามสรุปทิศทางจากข้อมูลที่ขาด** — ถ้าคำนวณ 25-Delta IV ได้เพียงฝั่งเดียว `skew_25d` จะเป็น `None` และขึ้น `N/A` (ไม่ใช่ 0.0) และถ้า delta-IV เปลี่ยนไม่ได้ จะรายงาน "งดสรุปเจตนา" แทนการเดาว่าเป็น Call/Put Writing
+- **Turso ล่มชั่วคราวไม่ทำให้ job ตาย** — retry network error และ HTTP 429/5xx (backoff, honour `Retry-After` cap 30s); SQL error ไม่ retry
+- **Telegram ล่มไม่ทำให้ token หลุด** — exception ถูก log เฉพาะชื่อคลาส ไม่ log URL ที่มี bot token
