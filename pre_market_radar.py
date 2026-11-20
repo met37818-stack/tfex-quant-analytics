@@ -19,10 +19,8 @@ import os
 import sys
 import math
 import time
-import calendar
 import datetime
 import argparse
-import requests
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
@@ -33,223 +31,37 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # ==============================================================================
-# CONFIGURATION & CONSTANTS
+# SHARED HELPERS (tfex_common)
 # ==============================================================================
+# Calendar, THOR unit handling, the Turso client and Telegram dispatch live in the
+# tfex_common package so the four TFEX repos stop drifting apart. Pinned to a tag in
+# requirements.txt. The names are imported directly (not wrapped) so every existing
+# call site - and the tests that patch `execute_turso_sql` on this module - keep
+# working against the single shared implementation.
+from tfex_common.calendar import (  # noqa: E402
+    get_penultimate_business_day,
+    get_series_expiry_date,
+)
+from tfex_common.constants import (  # noqa: E402
+    BKK_TZ,
+    CHARM_CLAMP,
+    CONTRACT_MULTIPLIER,
+    SET_HOLIDAYS,
+    THOR_MAX_PCT,
+)
+from tfex_common.telegram import send_alert as send_telegram_alert  # noqa: E402
+from tfex_common.thor import select_dynamic_thor_rate  # noqa: E402
+from tfex_common.thor import to_decimal_rate as _to_decimal_rate  # noqa: E402
+from tfex_common.turso import execute_sql as execute_turso_sql  # noqa: E402
+from tfex_common.turso import normalize_url as normalize_turso_url  # noqa: E402
 
-BKK_TZ = datetime.timezone(datetime.timedelta(hours=7))
-CONTRACT_MULTIPLIER = 200.0  # TFEX SET50 Index: 200 THB per index point
-
-# THOR (BOT) publishes rates as PERCENT per annum (0.994 == 0.994%).
-# Never infer the unit from magnitude: 0.45% would be read as 45%, and since r is
-# fed into Black-76 it shifts every solved IV (measured: IV 18% -> 24.2% on an
-# ITM call) and therefore the 25-delta skew and the theta/gamma breakeven.
-THOR_MAX_PCT = 25.0
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
 
 # Volume-profile price bucket in index points (SET50 futures tick is 0.1).
 VOLUME_PROFILE_BUCKET = 0.1
 
-# Hard clamp for dealer charm exposure when DTE <= 2 (asymptote guard).
-CHARM_CLAMP = 5000.0
-
-# Official SET Holidays (2026 - 2028)
-SET_HOLIDAYS = {
-    # 2026
-    "2026-01-01", "2026-01-02", "2026-03-03", "2026-04-06", "2026-04-13",
-    "2026-04-14", "2026-04-15", "2026-05-01", "2026-05-04", "2026-06-01",
-    "2026-06-03", "2026-07-28", "2026-07-29", "2026-08-12", "2026-10-13",
-    "2026-10-16", "2026-10-23", "2026-12-07", "2026-12-10", "2026-12-31",
-    # 2027
-    "2027-01-01", "2027-02-22", "2027-04-06", "2027-04-13", "2027-04-14",
-    "2027-04-15", "2027-05-03", "2027-05-04", "2027-05-20", "2027-06-03",
-    "2027-07-19", "2027-07-28", "2027-08-12", "2027-10-13", "2027-10-25",
-    "2027-12-06", "2027-12-10", "2027-12-31",
-    # 2028
-    "2028-01-03", "2028-02-10", "2028-04-06", "2028-04-13", "2028-04-14",
-    "2028-05-01", "2028-05-05", "2028-06-05", "2028-07-17", "2028-07-28",
-    "2028-08-14", "2028-10-13", "2028-10-23", "2028-12-05", "2028-12-11"
-}
-
-# ==============================================================================
-# TURSO DATABASE CLIENT & HELPERS
-# ==============================================================================
-
-def normalize_turso_url(raw_url: str) -> str:
-    """Normalize Turso URL to HTTP Pipeline endpoint (/v2/pipeline)."""
-    url = raw_url.strip()
-    if url.startswith("libsql://"):
-        url = "https://" + url[len("libsql://"):]
-    elif not url.startswith("http://") and not url.startswith("https://"):
-        url = "https://" + url
-    url = url.rstrip("/")
-    if not url.endswith("/v2/pipeline"):
-        url = url + "/v2/pipeline"
-    return url
-
-def to_turso_arg(val) -> dict:
-    """Format Python values into libSQL / Turso typed arguments."""
-    if val is None:
-        return {"type": "null"}
-    elif isinstance(val, bool):
-        return {"type": "integer", "value": "1" if val else "0"}
-    elif isinstance(val, int):
-        return {"type": "integer", "value": str(val)}
-    elif isinstance(val, float):
-        if math.isnan(val) or math.isinf(val):
-            return {"type": "null"}
-        return {"type": "float", "value": val}
-    else:
-        return {"type": "text", "value": str(val)}
-
-def execute_turso_sql(pipeline_url: str, auth_token: str, sql: str, args: list = None,
-                      max_attempts: int = 3) -> tuple[list[str], list[list]]:
-    """
-    Execute a single SQL statement on Turso and return (columns, rows).
-
-    Transient failures (network errors, HTTP 429/5xx) retry with exponential
-    backoff honouring Retry-After up to 30s. SQL errors are deterministic and are
-    raised immediately. An empty/odd `results` envelope no longer raises
-    IndexError - it is reported as a clear RuntimeError instead.
-    """
-    headers = {
-        "Authorization": f"Bearer {auth_token}",
-        "Content-Type": "application/json"
-    }
-    turso_args = [to_turso_arg(a) for a in (args or [])]
-    payload = {
-        "requests": [
-            {
-                "type": "execute",
-                "stmt": {
-                    "sql": sql.strip(),
-                    "args": turso_args
-                }
-            },
-            {"type": "close"}
-        ]
-    }
-
-    last_exc = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            resp = requests.post(pipeline_url, headers=headers, json=payload, timeout=25)
-        except requests.RequestException as exc:
-            last_exc = exc
-            delay = min(2.0 ** (attempt - 1), 8.0)
-        else:
-            if resp.status_code == 429 or resp.status_code >= 500:
-                last_exc = RuntimeError(f"Turso query failed (HTTP {resp.status_code}): {resp.text[:200]}")
-                retry_after = (resp.headers.get("Retry-After") or "").strip()
-                delay = min(float(retry_after), 30.0) if retry_after.replace(".", "", 1).isdigit() \
-                    else min(2.0 ** (attempt - 1), 8.0)
-            elif resp.status_code != 200:
-                raise RuntimeError(f"Turso query failed (HTTP {resp.status_code}): {resp.text[:200]}")
-            else:
-                data = resp.json()
-                results = data.get("results") or []
-                if not results:
-                    raise RuntimeError(
-                        f"Turso returned no results envelope (payload keys: {sorted(data.keys())})"
-                    )
-                result_item = results[0]
-                if result_item.get("type") == "error":
-                    raise RuntimeError(f"Turso SQL execution error: {result_item.get('error')}")
-                return _parse_turso_result(result_item)
-
-        if attempt >= max_attempts:
-            break
-        print(f"[TURSO] {type(last_exc).__name__} on attempt {attempt}/{max_attempts}: "
-              f"{str(last_exc)[:120]} - retry in {delay:.0f}s")
-        time.sleep(delay)
-
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError("Turso request failed without a captured error")
-
-
-def _parse_turso_result(result_item: dict) -> tuple[list[str], list[list]]:
-
-    r = result_item.get("response", {}).get("result", {})
-    cols = [c["name"] for c in r.get("cols", [])]
-    rows = []
-    for raw_row in r.get("rows", []):
-        parsed_row = []
-        for cell in raw_row:
-            ctype = cell.get("type")
-            cval = cell.get("value")
-            if ctype == "null" or cval is None:
-                parsed_row.append(None)
-            elif ctype == "integer":
-                parsed_row.append(int(cval))
-            elif ctype == "float":
-                parsed_row.append(float(cval))
-            else:
-                parsed_row.append(cval)
-        rows.append(parsed_row)
-    return cols, rows
-
-def _to_decimal_rate(val, label: str = "") -> float | None:
-    """
-    Converts a BOT THOR reading into a decimal annual rate.
-
-    THOR is ALWAYS percent per annum, so divide by 100 unconditionally. The old
-    heuristic (v/100 if v > 0.5 else v) silently turned 0.45% into 45%: with r
-    fed into Black-76 the IV solver returns a wrong sigma (18% -> 24.2% on an
-    ITM call at 30 DTE), which distorts the 25-delta skew and the theta/gamma
-    breakeven move.
-    """
-    if val is None:
-        return None
-    pct = float(val)
-    if pct <= 0:
-        return None
-    if pct > THOR_MAX_PCT:
-        raise ValueError(
-            f"THOR rate out of range: {pct} ({label}) — expected percent p.a., "
-            f"max {THOR_MAX_PCT}%"
-        )
-    return pct / 100.0
-
-
-def select_dynamic_thor_rate(
-    thor_record: dict,
-    dte: int
-) -> tuple[float, str]:
-    """
-    Selects dynamic THOR rate matching the option's DTE (Days to Expiration).
-    
-    Tenor Selection Rules:
-    - dte <= 30 days:
-        Prefer 1M Compounded ('1m')
-        Fallback: Overnight ('overnight')
-    - 30 < dte <= 90 days:
-        Prefer 3M Compounded ('3m')
-        Fallback: 1M Compounded ('1m') -> Overnight ('overnight')
-    - 90 < dte <= 180 days:
-        Prefer 6M Compounded ('6m')
-        Fallback: 3M Compounded ('3m') -> 1M Compounded -> Overnight
-    - dte > 180 days:
-        Prefer 6M Compounded ('6m')
-        Fallback: 3M Compounded -> Overnight
-    """
-    r_on = _to_decimal_rate(thor_record.get("overnight"), "overnight")
-    r_1m = _to_decimal_rate(thor_record.get("1m"), "1m")
-    r_3m = _to_decimal_rate(thor_record.get("3m"), "3m")
-    r_6m = _to_decimal_rate(thor_record.get("6m"), "6m")
-
-    if dte <= 30:
-        candidates = [("1M", r_1m), ("ON", r_on), ("3M", r_3m), ("6M", r_6m)]
-    elif dte <= 90:
-        candidates = [("3M", r_3m), ("1M", r_1m), ("ON", r_on), ("6M", r_6m)]
-    elif dte <= 180:
-        candidates = [("6M", r_6m), ("3M", r_3m), ("1M", r_1m), ("ON", r_on)]
-    else:
-        candidates = [("6M", r_6m), ("3M", r_3m), ("ON", r_on), ("1M", r_1m)]
-
-    for label, rate in candidates:
-        if rate is not None and rate > 0:
-            return rate, label
-
-    raise ValueError(f"No valid THOR rate found in record: {thor_record}")
 
 
 def init_analytics_tables(pipeline_url: str, auth_token: str):
@@ -278,43 +90,6 @@ def init_analytics_tables(pipeline_url: str, auth_token: str):
     );
     """
     execute_turso_sql(pipeline_url, auth_token, ddl_rv)
-
-# ==============================================================================
-# CALENDAR & EXPIRY UTILITIES
-# ==============================================================================
-
-def get_penultimate_business_day(year: int, month: int, holidays: set = SET_HOLIDAYS) -> datetime.date:
-    """
-    Calculate the penultimate business day of a given month.
-    (TFEX contract specification for SET50 Futures & Options expiration).
-    """
-    if not any(str(h).startswith(str(year)) for h in holidays):
-        print(f"[CALENDAR] WARNING: SET_HOLIDAYS has no data for {year} - the expiry date for "
-              f"{year}-{month:02d} may be wrong. Update SET_HOLIDAYS before trading that year.")
-
-    _, last_day = calendar.monthrange(year, month)
-    biz_days = []
-    for d in range(1, last_day + 1):
-        dt = datetime.date(year, month, d)
-        if dt.weekday() < 5 and dt.strftime("%Y-%m-%d") not in holidays:
-            biz_days.append(dt)
-    if len(biz_days) < 2:
-        return biz_days[-1] if biz_days else datetime.date(year, month, last_day)
-    return biz_days[-2]
-
-def get_series_expiry_date(series_code: str, ref_date: datetime.date) -> datetime.date:
-    """
-    Determine expiration date for a quarterly series (e.g., S50Z26 -> Dec 2026).
-    Quarter codes: H = March, M = June, U = September, Z = December.
-    """
-    code_map = {"H": 3, "M": 6, "U": 9, "Z": 12}
-    quarter_char = series_code[3].upper()
-    quarter_month = code_map.get(quarter_char, 12)
-    year_suffix = int(series_code[4:6])
-    full_year = 2000 + year_suffix
-
-    expiry = get_penultimate_business_day(full_year, quarter_month)
-    return expiry
 
 # ==============================================================================
 # QUANT & DERIVATIVES MATHEMATICS (BLACK-76 & GREEKS)
@@ -2238,42 +2013,6 @@ def build_interactive_dashboard(
         print(f"[PAGES] Warning: Failed to save dashboard to public/index.html: {e}")
 
     return html_path
-
-# ==============================================================================
-# TELEGRAM DISPATCHER
-# ==============================================================================
-
-def send_telegram_alert(
-    bot_token: str,
-    chat_id: str,
-    message_html: str
-) -> bool:
-    """
-    Sends the rich HTML summary to Telegram.
-
-    S1: the unused html_file_path parameter is gone.
-    C2: the request is wrapped in try/except. requests puts the full request URL -
-    which contains the bot token - into ConnectionError/Timeout messages, and a
-    traceback in the Actions log of this public repository would leak the token.
-    An uncaught error also aborted the run after the Turso log had been written.
-    """
-    msg_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message_html,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        r = requests.post(msg_url, json=payload, timeout=20)
-    except Exception as e:
-        print(f"[TELEGRAM] Warning: sendMessage raised {type(e).__name__} (URL/token redacted)")
-        return False
-    if r.status_code != 200:
-        print(f"[TELEGRAM] Warning: sendMessage failed ({r.status_code}): {r.text[:200]}")
-        return False
-    print("[TELEGRAM] Pre-market summary text delivered successfully.")
-    return True
 
 # ==============================================================================
 # CORE WORKFLOW ORCHESTRATOR

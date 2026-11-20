@@ -8,3 +8,7 @@ pandas==3.1.1
 plotly==7.1.0
 requests==2.34.2
 python-dotenv==1.2.4
+# Shared calendar / THOR / Turso / Telegram helpers (extracted 2026-11).
+# Pinned to a tag: never track main, or a shared fix reaches production
+# without review.
+tfex-common @ git+https://github.com/met37818-stack/tfex-common.git@v0.2.0
