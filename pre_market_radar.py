@@ -269,8 +269,8 @@ def black76_price(F: float, K: float, T: float, r: float, sigma: float, option_t
         return disc * (K * norm.cdf(-d2) - F * norm.cdf(-d1))
 
 def calculate_implied_vol(price: float, F: float, K: float, T: float, r: float, option_type: str) -> float | None:
-    """Solve for Black-76 Implied Volatility via Brent's method."""
-    if price is None or price <= 0.0 or T <= 0.0:
+    """Solve for Black-76 Implied Volatility via Brent's method, capped at 1.50 (150%)."""
+    if price is None or price <= 0.0 or T <= 0.0 or F <= 0.0 or K <= 0.0:
         return None
 
     disc = math.exp(-r * T)
@@ -278,11 +278,17 @@ def calculate_implied_vol(price: float, F: float, K: float, T: float, r: float, 
     if price <= intrinsic + 1e-4:
         return None
 
+    MAX_IV = 1.50
+    p_high = black76_price(F, K, T, r, MAX_IV, option_type)
+    if price >= p_high:
+        return None
+
     def obj(sigma):
         return black76_price(F, K, T, r, sigma, option_type) - price
 
     try:
-        return float(brentq(obj, 1e-4, 5.0, maxiter=100))
+        iv = float(brentq(obj, 1e-4, MAX_IV, maxiter=100))
+        return iv if 1e-4 <= iv <= MAX_IV else None
     except Exception:
         return None
 
@@ -312,6 +318,10 @@ def calculate_black76_greeks(F: float, K: float, T: float, r: float, sigma: floa
         theta_put = - (F * disc * pdf_d1 * sigma) / (2.0 * sqrt_T) - r * disc * (K * norm.cdf(-d2) - F * norm.cdf(-d1))
         theta_1d = theta_put / 365.0
         charm_1d = (-r * disc * norm.cdf(-d1) + disc * pdf_d1 * (d2 / (2.0 * T))) / 365.0
+
+    # Dampen / cap Charm when DTE <= 2 to prevent near-expiry asymptotic explosion
+    if T <= (2.0 / 365.0) or math.isnan(charm_1d) or math.isinf(charm_1d):
+        charm_1d = max(-5.0, min(5.0, charm_1d)) if not (math.isnan(charm_1d) or math.isinf(charm_1d)) else 0.0
 
     vanna = -disc * pdf_d1 * (d2 / sigma)
 
@@ -405,8 +415,19 @@ def analyze_options_greeks_edge(
         }
 
     # 1. 25-Delta Skew Calculation (Interpolated)
-    calls = [r for r in greeks_records if r["option_type"] == "C"]
-    puts = [r for r in greeks_records if r["option_type"] == "P"]
+    # Filter out illiquid (OI == 0), extreme delta (< 0.10 or > 0.90), and exploded IV (> 1.50)
+    valid_calls = [
+        r for r in greeks_records 
+        if r["option_type"] == "C" and r.get("oi", 0) > 0 and 0.10 <= r["delta"] <= 0.90 and (r.get("iv") is not None and r["iv"] <= 1.50)
+    ]
+    valid_puts = [
+        r for r in greeks_records 
+        if r["option_type"] == "P" and r.get("oi", 0) > 0 and 0.10 <= abs(r["delta"]) <= 0.90 and (r.get("iv") is not None and r["iv"] <= 1.50)
+    ]
+
+    calls = valid_calls if len(valid_calls) >= 2 else [r for r in greeks_records if r["option_type"] == "C" and (r.get("iv") is not None and r["iv"] <= 1.50)]
+    puts = valid_puts if len(valid_puts) >= 2 else [r for r in greeks_records if r["option_type"] == "P" and (r.get("iv") is not None and r["iv"] <= 1.50)]
+
     calls.sort(key=lambda x: x["delta"], reverse=True)
     puts.sort(key=lambda x: abs(x["delta"]))
 
@@ -458,9 +479,18 @@ def analyze_options_greeks_edge(
         daily_breakeven_move = 0.0
 
     # 3. Market Maker Dealer Flow (Net Dealer Vanna & Charm Exposure)
-    # Dealer is short customer OI
-    dealer_vanna = -sum(r["vanna"] * r["oi"] for r in greeks_records) * 0.01
-    dealer_charm = -sum(r["charm"] * r["oi"] for r in greeks_records)
+    # Dealer is short customer OI. Filter extreme delta / illiquid strikes to prevent distorted flow.
+    flow_records = [
+        r for r in greeks_records 
+        if r.get("oi", 0) > 0 and 0.10 <= abs(r.get("delta", 0.0)) <= 0.90 and (r.get("iv") is None or r["iv"] <= 1.50)
+    ]
+    if len(flow_records) < 3:
+        flow_records = [r for r in greeks_records if r.get("oi", 0) > 0]
+
+    dealer_vanna = -sum(r["vanna"] * r["oi"] for r in flow_records) * 0.01
+    dealer_charm = -sum(r["charm"] * r["oi"] for r in flow_records)
+    if T_front <= (2.0 / 365.0):
+        dealer_charm = max(-5000.0, min(5000.0, dealer_charm))
 
     if dealer_vanna > 50:
         vanna_bias_desc = "หาก IV Crush ดีลเลอร์จะซื้อ Futures พยุงตลาด"
@@ -1004,6 +1034,21 @@ def resample_cdc_to_1min_prices(raw_rows: List[Any], trade_date: str) -> List[fl
     return resampled_prices
 
 
+def resample_cdc_to_5min_prices(raw_rows: List[Any], trade_date: str) -> List[float]:
+    """
+    Resamples CDC ticks to 5-minute frequency bars (09:45, 09:50, ..., 16:50, 16:54)
+    to dampen microstructure noise / bid-ask bounce in Realized Volatility (RV) calculations.
+    """
+    prices_1m = resample_cdc_to_1min_prices(raw_rows, trade_date)
+    if not prices_1m:
+        return []
+    # Sample every 5th minute: index 0, 5, 10, ...
+    prices_5m = prices_1m[::5]
+    if (len(prices_1m) - 1) % 5 != 0:
+        prices_5m.append(prices_1m[-1])
+    return prices_5m
+
+
 def compute_intraday_rv(
     pipeline_url: str,
     auth_token: str,
@@ -1013,7 +1058,8 @@ def compute_intraday_rv(
 ) -> dict:
     """
     Fetches 1-minute candlestick data from Turso (futures_snapshots / spot_snapshots),
-    computes log returns to determine Annualized Realized Volatility (RV),
+    resamples to 5-minute bars to eliminate microstructure noise,
+    incorporates overnight gap ln(O_t / C_t-1)^2 for full-day close-to-close RV,
     persists/upserts into daily_realized_vol table, and compares RV vs ATM IV.
     """
     now_bkk = datetime.datetime.now(BKK_TZ)
@@ -1041,13 +1087,35 @@ def compute_intraday_rv(
             }
 
         is_valid_rv = (bar_count >= 310)
-        log_returns = [
-            math.log(prices[i] / prices[i - 1]) 
-            for i in range(1, bar_count) 
-            if prices[i] > 0 and prices[i - 1] > 0
+
+        # Resample to 5-minute bars to eliminate microstructure noise & bid-ask bounce
+        prices_5m = resample_cdc_to_5min_prices(rows_fut, trade_date)
+        log_returns_5m = [
+            math.log(prices_5m[i] / prices_5m[i - 1]) 
+            for i in range(1, len(prices_5m)) 
+            if prices_5m[i] > 0 and prices_5m[i - 1] > 0
         ]
-        sum_sq = sum(r * r for r in log_returns)
-        rv_annualized = math.sqrt(252.0 * sum_sq)
+        intraday_var = sum(r * r for r in log_returns_5m)
+
+        # Close-to-Close RV incorporating Overnight Gap: ln(O_t / C_t_minus_1)^2
+        overnight_var = 0.0
+        try:
+            sql_prev = """
+            SELECT last FROM futures_snapshots 
+            WHERE symbol = ? AND captured_at_bkk < ? AND last IS NOT NULL AND last > 0 
+            ORDER BY captured_at_bkk DESC LIMIT 1;
+            """
+            _, rows_prev = execute_turso_sql(pipeline_url, auth_token, sql_prev, [front_series, f"{trade_date} 09:00:00"])
+            if rows_prev and rows_prev[0][0] is not None and float(rows_prev[0][0]) > 0:
+                prev_close = float(rows_prev[0][0])
+                if prices_5m and prices_5m[0] > 0 and prev_close > 0:
+                    r_overnight = math.log(prices_5m[0] / prev_close)
+                    overnight_var = r_overnight * r_overnight
+        except Exception as e:
+            print(f"[RV] Note fetching prev close for overnight gap: {e}")
+
+        total_daily_var = overnight_var + intraday_var
+        rv_annualized = math.sqrt(252.0 * total_daily_var)
 
         # 2. Persist / UPSERT to daily_realized_vol
         upsert_sql = """
@@ -2498,35 +2566,40 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         pain_payouts.append((s_eval, total_payout))
     max_pain = float(min(pain_payouts, key=lambda x: x[1])[0])
 
-    # Gamma Flip (Zero Crossing in Active Zone Spot ± 75 pts to avoid far-strike distortions)
-    active_gex_df = res_df[(res_df["strike"] >= futures_ref - 75.0) & (res_df["strike"] <= futures_ref + 75.0)].copy()
-    if len(active_gex_df) < 3:
-        active_gex_df = res_df.copy()
+    # True Gamma Flip Calculation: Search for S where Total_Net_GEX(S) = sum_k(GEX_k(S)) = 0
+    # over active grid S in [futures_ref - 75.0, futures_ref + 75.0] in 1.0 pt increments
+    s_grid = np.arange(futures_ref - 75.0, futures_ref + 75.0 + 0.5, 1.0)
+    net_gex_curve = []
+    disc_front = math.exp(-r_rf * T_front)
+    sqrt_T_front = math.sqrt(T_front)
+
+    for s_eval in s_grid:
+        total_gex_s = 0.0
+        for _, r_k in res_df.iterrows():
+            k_val = r_k["strike"]
+            c_oi = r_k["call_oi"]
+            p_oi = r_k["put_oi"]
+            sig_k = r_k["iv"]
+            if sig_k <= 0 or s_eval <= 0 or k_val <= 0:
+                continue
+            d1_s = (math.log(s_eval / k_val) + 0.5 * sig_k * sig_k * T_front) / (sig_k * sqrt_T_front)
+            pdf_s = norm.pdf(d1_s)
+            gamma_s = (disc_front * pdf_s) / (s_eval * sig_k * sqrt_T_front)
+            # Net GEX(S) in Million THB: gamma_s * (c_oi - p_oi) * CONTRACT_MULTIPLIER * s_eval / 1e6
+            gex_k_s = gamma_s * (c_oi - p_oi) * CONTRACT_MULTIPLIER * s_eval / 1e6
+            total_gex_s += gex_k_s
+        net_gex_curve.append((s_eval, total_gex_s))
 
     flip_candidates = []
-    # 1. Search zero crossings for cum_gex within active strikes
-    for i in range(len(active_gex_df) - 1):
-        c1 = active_gex_df.iloc[i]["cum_gex"]
-        c2 = active_gex_df.iloc[i + 1]["cum_gex"]
-        k1 = active_gex_df.iloc[i]["strike"]
-        k2 = active_gex_df.iloc[i + 1]["strike"]
-        if (c1 <= 0 and c2 >= 0) or (c1 >= 0 and c2 <= 0):
-            if c2 != c1:
-                flip_candidates.append(float(k1 + (0 - c1) * (k2 - k1) / (c2 - c1)))
+    for i in range(len(net_gex_curve) - 1):
+        s1, g1 = net_gex_curve[i]
+        s2, g2 = net_gex_curve[i + 1]
+        if (g1 <= 0.0 and g2 >= 0.0) or (g1 >= 0.0 and g2 <= 0.0):
+            if abs(g2 - g1) > 1e-9:
+                s_zero = s1 - g1 * (s2 - s1) / (g2 - g1)
+                flip_candidates.append(float(s_zero))
             else:
-                flip_candidates.append(float(k1))
-
-    # 2. Search zero crossings for net_gex_mb within active strikes
-    for i in range(len(active_gex_df) - 1):
-        g1 = active_gex_df.iloc[i]["net_gex_mb"]
-        g2 = active_gex_df.iloc[i + 1]["net_gex_mb"]
-        k1 = active_gex_df.iloc[i]["strike"]
-        k2 = active_gex_df.iloc[i + 1]["strike"]
-        if (g1 <= 0 and g2 >= 0) or (g1 >= 0 and g2 <= 0):
-            if g2 != g1:
-                flip_candidates.append(float(k1 + (0 - g1) * (k2 - k1) / (g2 - g1)))
-            else:
-                flip_candidates.append(float(k1))
+                flip_candidates.append(float(s1))
 
     if flip_candidates:
         # Pick zero-crossing closest to futures_ref
