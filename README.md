@@ -124,6 +124,10 @@
 
 ---
 
+## 🧩 โค้ดที่ใช้ร่วมกับ repo อื่น (tfex-common)
+
+ปฏิทิน SET / expiry, THOR unit handling, Turso client และ Telegram dispatch ไม่ได้อยู่ในไฟล์นี้แล้ว — import จาก [`tfex-common`](https://github.com/met37818-stack/tfex-common) (ปักหมุด tag ใน `requirements.txt`) เพื่อให้ทั้ง 4 repo ใช้โค้ดชุดเดียวกัน
+
 ## ⚠️ ข้อกำหนดด้านข้อมูล (Fail-Loud Rules)
 
 - **THOR ต้องเป็น percent p.a. เท่านั้น** — ระบบหาร 100 แบบไม่มีเงื่อนไข (เดิมเดาจากขนาด ทำให้ THOR 0.45% อ่านเป็น 45% แล้ว IV ที่แก้ได้เพี้ยนไปหลาย vol point) และจะ `raise` ถ้าค่าเกิน `THOR_MAX_PCT = 25.0`

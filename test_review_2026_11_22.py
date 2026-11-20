@@ -2,9 +2,8 @@
 Regression tests for the 2026-11-22 review of pre_market_radar.py
 
 C1  THOR unit handling (0.45% must stay 0.45%, not 45%) and its effect on solved IV
-C2  Telegram failures must not leak the bot token into logs and must not raise
-W1  Turso responses without a `results` envelope must not raise IndexError
-W2  Transient Turso failures retry; SQL errors do not
+C2  Telegram redaction now lives in tfex_common/tests/test_telegram.py
+W1/W2 Turso retry + envelope handling now lives in tfex_common/tests/test_turso.py
 W3  25-delta skew must be None (not 0.0) when one side has no IV
 W4  Options footprint must not turn missing IV into "Call Writing"
 W5  theta must match a finite-difference of black76_price
@@ -13,6 +12,7 @@ W8  SET holidays cover 2026-10-16 and warn outside the table
 import io
 import math
 import unittest
+import warnings
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
@@ -55,85 +55,6 @@ class TestThetaMatchesFiniteDifference(unittest.TestCase):
                    - pmr.black76_price(F, K, T - h, r, sig, otype)) / (2 * h) / 365.0
             self.assertAlmostEqual(theta, fd, delta=abs(fd) * 0.005 + 1e-6,
                                    msg=f"theta mismatch at {F}/{K} T={T} {otype}")
-
-
-class TestTursoClient(unittest.TestCase):
-
-    def test_missing_results_envelope_raises_clear_error(self):
-        class R:
-            status_code = 200
-            headers = {}
-            text = "{}"
-            def json(self):
-                return {"foo": "bar"}
-        with patch.object(pmr.requests, "post", return_value=R()):
-            with self.assertRaises(RuntimeError) as ctx:
-                pmr.execute_turso_sql("http://x", "t", "SELECT 1")
-        self.assertIn("no results envelope", str(ctx.exception))
-
-    def test_retries_transient_then_succeeds(self):
-        calls = {"n": 0}
-
-        class Bad:
-            status_code = 503
-            headers = {}
-            text = "unavailable"
-            def json(self):
-                return {}
-
-        class Good:
-            status_code = 200
-            headers = {}
-            text = ""
-            def json(self):
-                return {"results": [{"type": "ok", "response": {"result": {
-                    "cols": [{"name": "x"}], "rows": [[{"type": "integer", "value": "7"}]]}}}]}
-
-        def fake_post(*a, **k):
-            calls["n"] += 1
-            return Bad() if calls["n"] < 3 else Good()
-
-        with patch.object(pmr.requests, "post", side_effect=fake_post), \
-             patch.object(pmr.time, "sleep", lambda *_: None):
-            cols, rows = pmr.execute_turso_sql("http://x", "t", "SELECT 1")
-        self.assertEqual(calls["n"], 3)
-        self.assertEqual(rows, [[7]])
-
-    def test_sql_error_is_not_retried(self):
-        class Err:
-            status_code = 200
-            headers = {}
-            text = ""
-            def json(self):
-                return {"results": [{"type": "error", "error": "no such table"}]}
-        calls = {"n": 0}
-        def fake_post(*a, **k):
-            calls["n"] += 1
-            return Err()
-        with patch.object(pmr.requests, "post", side_effect=fake_post):
-            with self.assertRaises(RuntimeError):
-                pmr.execute_turso_sql("http://x", "t", "SELECT 1")
-        self.assertEqual(calls["n"], 1, "SQL error ต้องไม่ retry")
-
-
-class TestTelegramRedaction(unittest.TestCase):
-
-    def test_connection_error_does_not_leak_token(self):
-        token = "123456789:AAFakeTokenForTestingOnly_abcdefghijklm"
-        buf = io.StringIO()
-
-        def boom(*a, **k):
-            raise pmr.requests.ConnectionError(
-                f"HTTPSConnectionPool(host='api.telegram.org'): Max retries exceeded "
-                f"with url: /bot{token}/sendMessage")
-
-        with patch.object(pmr.requests, "post", side_effect=boom), redirect_stdout(buf):
-            ok = pmr.send_telegram_alert(token, "12345", "<b>hi</b>")
-
-        out = buf.getvalue()
-        self.assertFalse(ok)
-        self.assertNotIn(token, out, "token ต้องไม่หลุดลง log")
-        self.assertIn("ConnectionError", out)
 
 
 class TestSkewAndFootprintHonesty(unittest.TestCase):
@@ -194,8 +115,10 @@ class TestCalendarTable(unittest.TestCase):
 
     def test_year_outside_table_warns(self):
         buf = io.StringIO()
-        with redirect_stdout(buf):
-            pmr.get_penultimate_business_day(2031, 3)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")   # tfex_common also raises RuntimeWarning
+            with redirect_stdout(buf):
+                pmr.get_penultimate_business_day(2031, 3)
         self.assertIn("no data for 2031", buf.getvalue())
 
 
