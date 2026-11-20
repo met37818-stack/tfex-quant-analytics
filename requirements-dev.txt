@@ -1,0 +1,5 @@
+# Development / test dependencies.
+# test_cdc_resampler.py needs pytest but requirements.txt never listed it, so a
+# fresh clone could not run the suite at all.
+-r requirements.txt
+pytest==9.2.0
