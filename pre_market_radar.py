@@ -18,6 +18,7 @@ Generates:
 import os
 import sys
 import math
+import time
 import calendar
 import datetime
 import argparse
@@ -38,13 +39,25 @@ from plotly.subplots import make_subplots
 BKK_TZ = datetime.timezone(datetime.timedelta(hours=7))
 CONTRACT_MULTIPLIER = 200.0  # TFEX SET50 Index: 200 THB per index point
 
+# THOR (BOT) publishes rates as PERCENT per annum (0.994 == 0.994%).
+# Never infer the unit from magnitude: 0.45% would be read as 45%, and since r is
+# fed into Black-76 it shifts every solved IV (measured: IV 18% -> 24.2% on an
+# ITM call) and therefore the 25-delta skew and the theta/gamma breakeven.
+THOR_MAX_PCT = 25.0
+
+# Volume-profile price bucket in index points (SET50 futures tick is 0.1).
+VOLUME_PROFILE_BUCKET = 0.1
+
+# Hard clamp for dealer charm exposure when DTE <= 2 (asymptote guard).
+CHARM_CLAMP = 5000.0
+
 # Official SET Holidays (2026 - 2028)
 SET_HOLIDAYS = {
     # 2026
     "2026-01-01", "2026-01-02", "2026-03-03", "2026-04-06", "2026-04-13",
     "2026-04-14", "2026-04-15", "2026-05-01", "2026-05-04", "2026-06-01",
     "2026-06-03", "2026-07-28", "2026-07-29", "2026-08-12", "2026-10-13",
-    "2026-10-23", "2026-12-07", "2026-12-10", "2026-12-31",
+    "2026-10-16", "2026-10-23", "2026-12-07", "2026-12-10", "2026-12-31",
     # 2027
     "2027-01-01", "2027-02-22", "2027-04-06", "2027-04-13", "2027-04-14",
     "2027-04-15", "2027-05-03", "2027-05-04", "2027-05-20", "2027-06-03",
@@ -87,8 +100,16 @@ def to_turso_arg(val) -> dict:
     else:
         return {"type": "text", "value": str(val)}
 
-def execute_turso_sql(pipeline_url: str, auth_token: str, sql: str, args: list = None) -> tuple[list[str], list[list]]:
-    """Execute a single SQL statement on Turso and return (columns, rows)."""
+def execute_turso_sql(pipeline_url: str, auth_token: str, sql: str, args: list = None,
+                      max_attempts: int = 3) -> tuple[list[str], list[list]]:
+    """
+    Execute a single SQL statement on Turso and return (columns, rows).
+
+    Transient failures (network errors, HTTP 429/5xx) retry with exponential
+    backoff honouring Retry-After up to 30s. SQL errors are deterministic and are
+    raised immediately. An empty/odd `results` envelope no longer raises
+    IndexError - it is reported as a clear RuntimeError instead.
+    """
     headers = {
         "Authorization": f"Bearer {auth_token}",
         "Content-Type": "application/json"
@@ -106,13 +127,46 @@ def execute_turso_sql(pipeline_url: str, auth_token: str, sql: str, args: list =
             {"type": "close"}
         ]
     }
-    resp = requests.post(pipeline_url, headers=headers, json=payload, timeout=25)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Turso query failed (HTTP {resp.status_code}): {resp.text}")
-    data = resp.json()
-    result_item = data.get("results", [])[0]
-    if result_item.get("type") == "error":
-        raise RuntimeError(f"Turso SQL execution error: {result_item.get('error')}")
+
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.post(pipeline_url, headers=headers, json=payload, timeout=25)
+        except requests.RequestException as exc:
+            last_exc = exc
+            delay = min(2.0 ** (attempt - 1), 8.0)
+        else:
+            if resp.status_code == 429 or resp.status_code >= 500:
+                last_exc = RuntimeError(f"Turso query failed (HTTP {resp.status_code}): {resp.text[:200]}")
+                retry_after = (resp.headers.get("Retry-After") or "").strip()
+                delay = min(float(retry_after), 30.0) if retry_after.replace(".", "", 1).isdigit() \
+                    else min(2.0 ** (attempt - 1), 8.0)
+            elif resp.status_code != 200:
+                raise RuntimeError(f"Turso query failed (HTTP {resp.status_code}): {resp.text[:200]}")
+            else:
+                data = resp.json()
+                results = data.get("results") or []
+                if not results:
+                    raise RuntimeError(
+                        f"Turso returned no results envelope (payload keys: {sorted(data.keys())})"
+                    )
+                result_item = results[0]
+                if result_item.get("type") == "error":
+                    raise RuntimeError(f"Turso SQL execution error: {result_item.get('error')}")
+                return _parse_turso_result(result_item)
+
+        if attempt >= max_attempts:
+            break
+        print(f"[TURSO] {type(last_exc).__name__} on attempt {attempt}/{max_attempts}: "
+              f"{str(last_exc)[:120]} - retry in {delay:.0f}s")
+        time.sleep(delay)
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Turso request failed without a captured error")
+
+
+def _parse_turso_result(result_item: dict) -> tuple[list[str], list[list]]:
 
     r = result_item.get("response", {}).get("result", {})
     cols = [c["name"] for c in r.get("cols", [])]
@@ -132,6 +186,29 @@ def execute_turso_sql(pipeline_url: str, auth_token: str, sql: str, args: list =
                 parsed_row.append(cval)
         rows.append(parsed_row)
     return cols, rows
+
+def _to_decimal_rate(val, label: str = "") -> float | None:
+    """
+    Converts a BOT THOR reading into a decimal annual rate.
+
+    THOR is ALWAYS percent per annum, so divide by 100 unconditionally. The old
+    heuristic (v/100 if v > 0.5 else v) silently turned 0.45% into 45%: with r
+    fed into Black-76 the IV solver returns a wrong sigma (18% -> 24.2% on an
+    ITM call at 30 DTE), which distorts the 25-delta skew and the theta/gamma
+    breakeven move.
+    """
+    if val is None:
+        return None
+    pct = float(val)
+    if pct <= 0:
+        return None
+    if pct > THOR_MAX_PCT:
+        raise ValueError(
+            f"THOR rate out of range: {pct} ({label}) — expected percent p.a., "
+            f"max {THOR_MAX_PCT}%"
+        )
+    return pct / 100.0
+
 
 def select_dynamic_thor_rate(
     thor_record: dict,
@@ -154,16 +231,10 @@ def select_dynamic_thor_rate(
         Prefer 6M Compounded ('6m')
         Fallback: 3M Compounded -> Overnight
     """
-    def _clean(val):
-        if val is None or float(val) <= 0:
-            return None
-        v = float(val)
-        return v / 100.0 if v > 0.5 else v
-
-    r_on = _clean(thor_record.get("overnight"))
-    r_1m = _clean(thor_record.get("1m"))
-    r_3m = _clean(thor_record.get("3m"))
-    r_6m = _clean(thor_record.get("6m"))
+    r_on = _to_decimal_rate(thor_record.get("overnight"), "overnight")
+    r_1m = _to_decimal_rate(thor_record.get("1m"), "1m")
+    r_3m = _to_decimal_rate(thor_record.get("3m"), "3m")
+    r_6m = _to_decimal_rate(thor_record.get("6m"), "6m")
 
     if dte <= 30:
         candidates = [("1M", r_1m), ("ON", r_on), ("3M", r_3m), ("6M", r_6m)]
@@ -217,6 +288,10 @@ def get_penultimate_business_day(year: int, month: int, holidays: set = SET_HOLI
     Calculate the penultimate business day of a given month.
     (TFEX contract specification for SET50 Futures & Options expiration).
     """
+    if not any(str(h).startswith(str(year)) for h in holidays):
+        print(f"[CALENDAR] WARNING: SET_HOLIDAYS has no data for {year} - the expiry date for "
+              f"{year}-{month:02d} may be wrong. Update SET_HOLIDAYS before trading that year.")
+
     _, last_day = calendar.monthrange(year, month)
     biz_days = []
     for d in range(1, last_day + 1):
@@ -310,12 +385,15 @@ def calculate_black76_greeks(F: float, K: float, T: float, r: float, sigma: floa
 
     if option_type == 'C':
         delta = disc * norm.cdf(d1)
-        theta_call = - (F * disc * pdf_d1 * sigma) / (2.0 * sqrt_T) - r * disc * (F * norm.cdf(d1) - K * norm.cdf(d2))
+        # theta = -dPrice/dT. dPrice/dT = +[F·disc·n(d1)·sigma/(2√T)] - r·Price,
+        # so the discount term carries a PLUS sign here (checked against a
+        # finite-difference of black76_price: the old -r·Price was 0.4-9.8% off).
+        theta_call = - (F * disc * pdf_d1 * sigma) / (2.0 * sqrt_T) + r * disc * (F * norm.cdf(d1) - K * norm.cdf(d2))
         theta_1d = theta_call / 365.0
         charm_1d = (r * disc * norm.cdf(d1) + disc * pdf_d1 * (d2 / (2.0 * T))) / 365.0
     else:
         delta = -disc * norm.cdf(-d1)
-        theta_put = - (F * disc * pdf_d1 * sigma) / (2.0 * sqrt_T) - r * disc * (K * norm.cdf(-d2) - F * norm.cdf(-d1))
+        theta_put = - (F * disc * pdf_d1 * sigma) / (2.0 * sqrt_T) + r * disc * (K * norm.cdf(-d2) - F * norm.cdf(-d1))
         theta_1d = theta_put / 365.0
         charm_1d = (-r * disc * norm.cdf(-d1) + disc * pdf_d1 * (d2 / (2.0 * T))) / 365.0
 
@@ -407,7 +485,7 @@ def analyze_options_greeks_edge(
 
     if not greeks_records:
         return {
-            "skew_25d": 0.0, "c_iv_pct": 0.0, "p_iv_pct": 0.0,
+            "skew_25d": None, "c_iv_pct": None, "p_iv_pct": None,
             "skew_desc": "ข้อมูล Greeks ไม่เพียงพอ", "atm_strike": futures_ref,
             "atm_gamma": 0.0, "atm_theta": 0.0, "theta_gamma_ratio": 0.0,
             "daily_breakeven_move": 0.0, "dealer_vanna": 0.0, "dealer_charm": 0.0,
@@ -451,16 +529,23 @@ def analyze_options_greeks_edge(
     if p_iv_25 is None and puts:
         p_iv_25 = min(puts, key=lambda x: abs(abs(x["delta"]) - 0.25))["iv"]
 
-    c_iv_pct = (c_iv_25 * 100.0) if c_iv_25 else 0.0
-    p_iv_pct = (p_iv_25 * 100.0) if p_iv_25 else 0.0
-    skew_25d = p_iv_pct - c_iv_pct
+    # W3: เดิมฝั่งที่ไม่มีข้อมูลถูกแทนด้วย 0.0 ทำให้ skew_25d = ผลต่างจริงข้างเดียว
+    # (เช่น 0 - 12.5 = -12.5) แล้วสรุปทิศทางจากข้อมูลที่ไม่มีอยู่จริง
+    c_iv_pct = (c_iv_25 * 100.0) if c_iv_25 is not None else None
+    p_iv_pct = (p_iv_25 * 100.0) if p_iv_25 is not None else None
 
-    if skew_25d > 2.0:
-        skew_desc = "Put แพงกว่า Call (ตลาดกังวลความเสี่ยงขาลง / พรีเมียมประกันพอร์ตสูง)"
-    elif skew_25d < -1.0:
-        skew_desc = "Call แพงกว่า Put (ตลาดไล่ซื้อ Call เก็งกำไร / Upside Call Skew)"
+    if c_iv_pct is None or p_iv_pct is None:
+        skew_25d = None
+        missing = "Call" if c_iv_pct is None else "Put"
+        skew_desc = f"ไม่มีข้อมูล 25-Delta IV ฝั่ง {missing} — งดสรุปทิศทาง skew"
     else:
-        skew_desc = "ความกลัว-โลภสองฝั่งสมดุล (Normal Skew)"
+        skew_25d = p_iv_pct - c_iv_pct
+        if skew_25d > 2.0:
+            skew_desc = "Put แพงกว่า Call (ตลาดกังวลความเสี่ยงขาลง / พรีเมียมประกันพอร์ตสูง)"
+        elif skew_25d < -1.0:
+            skew_desc = "Call แพงกว่า Put (ตลาดไล่ซื้อ Call เก็งกำไร / Upside Call Skew)"
+        else:
+            skew_desc = "ความกลัว-โลภสองฝั่งสมดุล (Normal Skew)"
 
     # 2. ATM Theta-to-Gamma Edge & Daily Breakeven Move
     if calls and puts:
@@ -490,7 +575,7 @@ def analyze_options_greeks_edge(
     dealer_vanna = -sum(r["vanna"] * r["oi"] for r in flow_records) * 0.01
     dealer_charm = -sum(r["charm"] * r["oi"] for r in flow_records)
     if T_front <= (2.0 / 365.0):
-        dealer_charm = max(-5000.0, min(5000.0, dealer_charm))
+        dealer_charm = max(-CHARM_CLAMP, min(CHARM_CLAMP, dealer_charm))
 
     if dealer_vanna > 50:
         vanna_bias_desc = "หาก IV Crush ดีลเลอร์จะซื้อ Futures พยุงตลาด"
@@ -859,7 +944,7 @@ def analyze_options_footprint(
 
         # 2. Fetch Options Series at T_0 and T_-1 for front_series
         sql_opts = """
-        SELECT option_type, strike, settlement_price, oi, volume 
+        SELECT option_type, strike, settlement_price, oi
         FROM eod_options_series 
         WHERE trade_date = ? AND (series = ? OR symbol LIKE ?);
         """
@@ -897,7 +982,9 @@ def analyze_options_footprint(
             if is_valid_0 and is_valid_prev:
                 div = (iv_0 - iv_prev) * 100.0
             else:
-                div = 0.0
+                # W4: ห้ามใช้ 0.0 แทน "ไม่รู้" เพราะ 0.0 ถูกตีความเป็น div <= 0
+                # = "Call Writing / Cap Resistance" ซึ่งเป็นการสรุปจากอากาศ
+                div = None
 
             item = {
                 "strike": strike,
@@ -918,8 +1005,10 @@ def analyze_options_footprint(
             top_call = max(calls_pos, key=lambda x: x["doi"])
             top_call_strike = float(top_call["strike"])
             top_call_doi = int(top_call["doi"])
-            top_call_div = float(top_call["div"])
-            if top_call_div > 0.5:
+            top_call_div = top_call["div"]  # None = IV เปลี่ยนไม่ได้
+            if top_call_div is None:
+                call_intent = "IV เปลี่ยนไม่ได้ (ข้อมูลไม่พอ) — งดสรุปเจตนา"
+            elif top_call_div > 0.5:
                 call_intent = "Aggressive Call Buying (เก็งกำไรทะลุต้าน)"
             elif top_call_div <= 0.0:
                 call_intent = "Call Writing / Cap Resistance (ล็อกแนวต้าน / เก็บพรีเมียม)"
@@ -928,7 +1017,7 @@ def analyze_options_footprint(
         else:
             top_call_strike = None
             top_call_doi = 0
-            top_call_div = 0.0
+            top_call_div = None
             call_intent = "ไม่มีการเปลี่ยนแปลง OI ที่มีนัยสำคัญ"
 
         # Top Put Strike with positive delta OI
@@ -937,8 +1026,10 @@ def analyze_options_footprint(
             top_put = max(puts_pos, key=lambda x: x["doi"])
             top_put_strike = float(top_put["strike"])
             top_put_doi = int(top_put["doi"])
-            top_put_div = float(top_put["div"])
-            if top_put_div > 0.5:
+            top_put_div = top_put["div"]  # None = IV เปลี่ยนไม่ได้
+            if top_put_div is None:
+                put_intent = "IV เปลี่ยนไม่ได้ (ข้อมูลไม่พอ) — งดสรุปเจตนา"
+            elif top_put_div > 0.5:
                 put_intent = "Aggressive Put Buying / Downside Hedging (ประกันความเสี่ยงขาลงเร่งด่วน)"
             elif top_put_div <= 0.0:
                 put_intent = "Put Writing / Floor Support (ขาย Put ล็อกฐานแนวรับ)"
@@ -947,7 +1038,7 @@ def analyze_options_footprint(
         else:
             top_put_strike = None
             top_put_doi = 0
-            top_put_div = 0.0
+            top_put_div = None
             put_intent = "ไม่มีการเปลี่ยนแปลง OI ที่มีนัยสำคัญ"
 
         return {
@@ -969,11 +1060,11 @@ def analyze_options_footprint(
             "foreign_put_net": 0,
             "top_call_strike": None,
             "top_call_doi": 0,
-            "top_call_div": 0.0,
+            "top_call_div": None,
             "call_intent": "ไม่มีการเปลี่ยนแปลง OI ที่มีนัยสำคัญ",
             "top_put_strike": None,
             "top_put_doi": 0,
-            "top_put_div": 0.0,
+            "top_put_div": None,
             "put_intent": "ไม่มีการเปลี่ยนแปลง OI ที่มีนัยสำคัญ"
         }
 
@@ -1119,8 +1210,12 @@ def compute_intraday_rv(
 
         # 2. Persist / UPSERT to daily_realized_vol
         upsert_sql = """
-        INSERT OR REPLACE INTO daily_realized_vol (trade_date, rv_annualized, bar_count, updated_at_bkk)
-        VALUES (?, ?, ?, ?);
+        INSERT INTO daily_realized_vol (trade_date, rv_annualized, bar_count, updated_at_bkk)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(trade_date) DO UPDATE SET
+            rv_annualized = excluded.rv_annualized,
+            bar_count = excluded.bar_count,
+            updated_at_bkk = excluded.updated_at_bkk;
         """
         execute_turso_sql(pipeline_url, auth_token, upsert_sql, [trade_date, rv_annualized, bar_count, updated_at_bkk])
 
@@ -1256,7 +1351,9 @@ def compute_volume_profile(
                     delta_v = 1.0
                 prev_vol = tot_v
 
-            k = round(px)
+            # S3: SET50 futures tick = 0.1 point. Bucketing at 1.0 point collapsed
+            # distinct price levels and made POC/VAH/VAL 10x coarser than the tick.
+            k = round(round(px / VOLUME_PROFILE_BUCKET) * VOLUME_PROFILE_BUCKET, 1)
             vol_by_price[k] = vol_by_price.get(k, 0.0) + max(1.0, delta_v)
 
         total_v = sum(vol_by_price.values()) if vol_by_price else 0.0
@@ -1605,9 +1702,9 @@ def generate_thai_trading_playbook(
     # Format Options Greeks & Skew Edge Block
     greeks_edge_lines = []
     if greeks_edge and greeks_edge.get("records_count", 0) > 0:
-        skew_val = greeks_edge.get("skew_25d", 0.0)
-        p_iv = greeks_edge.get("p_iv_pct", 0.0)
-        c_iv = greeks_edge.get("c_iv_pct", 0.0)
+        skew_val = greeks_edge.get("skew_25d")
+        p_iv = greeks_edge.get("p_iv_pct")
+        c_iv = greeks_edge.get("c_iv_pct")
         skew_desc = greeks_edge.get("skew_desc", "สมดุล")
         be_move = greeks_edge.get("daily_breakeven_move", 0.0)
         tg_ratio = greeks_edge.get("theta_gamma_ratio", 0.0)
@@ -1616,9 +1713,16 @@ def generate_thai_trading_playbook(
         vanna_desc = greeks_edge.get("vanna_bias_desc", "")
         be_rule = "แกว่ง > ค่านี้เน้น Long / แคบกว่าเน้น Short รับ Theta"
 
+        # W3: skew/IV อาจเป็น None เมื่อข้อมูลฝั่งใดฝั่งหนึ่งขาด -> ห้าม format ด้วย :.2f
+        if skew_val is None or p_iv is None or c_iv is None:
+            skew_line = f"  - <b>25Δ Skew:</b> <code>N/A</code> ➔ <i>{skew_desc}</i>"
+        else:
+            skew_line = (f"  - <b>25Δ Skew:</b> <code>{skew_val:+.2f}%</code> "
+                         f"(Put <code>{p_iv:.1f}%</code> vs Call <code>{c_iv:.1f}%</code>) ➔ <i>{skew_desc}</i>")
+
         greeks_edge_lines = [
             f"• <b>Options Greeks & Skew Edge ({front_series}):</b>",
-            f"  - <b>25Δ Skew:</b> <code>{skew_val:+.2f}%</code> (Put <code>{p_iv:.1f}%</code> vs Call <code>{c_iv:.1f}%</code>) ➔ <i>{skew_desc}</i>",
+            skew_line,
             f"  - <b>ATM Breakeven Move:</b> <code>{be_move:.1f}</code> จุด/วัน (θ/γ: <code>{tg_ratio:.1f}</code>) ➔ <i>{be_rule}</i>",
             f"  - <b>Dealer Flow:</b> Vanna <code>{d_vanna:+,.0f}</code> สัญญา/1% IV | Charm <code>{d_charm:+,.0f}</code>/วัน ➔ <i>{vanna_desc}</i>"
         ]
@@ -2142,24 +2246,31 @@ def build_interactive_dashboard(
 def send_telegram_alert(
     bot_token: str,
     chat_id: str,
-    message_html: str,
-    html_file_path: str = None
+    message_html: str
 ) -> bool:
     """
-    Sends rich HTML summary message with direct link to GitHub Pages dashboard.
-    """
-    base_url = f"https://api.telegram.org/bot{bot_token}"
+    Sends the rich HTML summary to Telegram.
 
-    msg_url = f"{base_url}/sendMessage"
+    S1: the unused html_file_path parameter is gone.
+    C2: the request is wrapped in try/except. requests puts the full request URL -
+    which contains the bot token - into ConnectionError/Timeout messages, and a
+    traceback in the Actions log of this public repository would leak the token.
+    An uncaught error also aborted the run after the Turso log had been written.
+    """
+    msg_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": message_html,
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
-    r = requests.post(msg_url, json=payload, timeout=20)
+    try:
+        r = requests.post(msg_url, json=payload, timeout=20)
+    except Exception as e:
+        print(f"[TELEGRAM] Warning: sendMessage raised {type(e).__name__} (URL/token redacted)")
+        return False
     if r.status_code != 200:
-        print(f"[TELEGRAM] Warning: sendMessage failed ({r.status_code}): {r.text}")
+        print(f"[TELEGRAM] Warning: sendMessage failed ({r.status_code}): {r.text[:200]}")
         return False
     print("[TELEGRAM] Pre-market summary text delivered successfully.")
     return True
@@ -2350,9 +2461,22 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
 
         if tg_token and tg_chat_id and not no_telegram:
             print(f"[TELEGRAM] Dispatching test notification to Chat ID {tg_chat_id}...")
-            send_telegram_alert(tg_token, tg_chat_id, telegram_text, html_file)
+            send_telegram_alert(tg_token, tg_chat_id, telegram_text)
         else:
             print("[TELEGRAM] Telegram credentials not configured or --no-telegram enabled. Test output displayed locally.")
+
+        # S5: --test ต้องเป็น smoke test จริง ไม่ใช่แค่พิมพ์ demo
+        # ตรวจว่าผลลัพธ์ที่ประกอบขึ้นมีส่วนสำคัญครบ ถ้าไม่ครบให้ fail (exit 1)
+        # เพื่อให้ job ใน CI จับ regression ของ formatter ได้
+        required_sections = ["Gamma Flip", "Max Pain", "Stop Loss"]
+        missing = [sec for sec in required_sections if sec.lower() not in telegram_text.lower()]
+        if missing:
+            print(f"[TEST] FAILED: telegram output missing sections: {missing}")
+            sys.exit(1)
+        if not os.path.exists(html_file):
+            print(f"[TEST] FAILED: dashboard file was not written ({html_file})")
+            sys.exit(1)
+        print(f"[TEST] OK: playbook sections present and dashboard written ({os.path.getsize(html_file):,} bytes)")
 
         if os.path.exists(html_file):
             try:
@@ -2818,7 +2942,9 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         T_front=T_front,
         front_opts_df=front_opts
     )
-    print(f"[GREEKS EDGE] Skew 25Δ: {greeks_edge['skew_25d']:+.2f}% | ATM Breakeven: {greeks_edge['daily_breakeven_move']:.1f} pts | Dealer Vanna: {greeks_edge['dealer_vanna']:+,.0f}")
+    _skew_dbg = greeks_edge.get("skew_25d")
+    _skew_txt = f"{_skew_dbg:+.2f}%" if _skew_dbg is not None else "N/A"
+    print(f"[GREEKS EDGE] Skew 25Δ: {_skew_txt} | ATM Breakeven: {greeks_edge['daily_breakeven_move']:.1f} pts | Dealer Vanna: {greeks_edge['dealer_vanna']:+,.0f}")
 
     # 9. Format Telegram Notification: Actionable Thai Trading Playbook
     now_bkk = datetime.datetime.now(BKK_TZ)
@@ -2859,9 +2985,18 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
     # 10. Persist Log to Turso Database
     print("[DATABASE] Logging pre-market execution record to analytics_premarket_log...")
     upsert_sql = """
-    INSERT OR REPLACE INTO analytics_premarket_log (
+    INSERT INTO analytics_premarket_log (
         trade_date, futures_ref, atm_iv, gamma_flip, call_wall, put_wall, max_pain, foreign_regime, sent_at_bkk
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(trade_date) DO UPDATE SET
+        futures_ref = excluded.futures_ref,
+        atm_iv = excluded.atm_iv,
+        gamma_flip = excluded.gamma_flip,
+        call_wall = excluded.call_wall,
+        put_wall = excluded.put_wall,
+        max_pain = excluded.max_pain,
+        foreign_regime = excluded.foreign_regime,
+        sent_at_bkk = excluded.sent_at_bkk;
     """
     execute_turso_sql(
         pipeline_url, turso_token, upsert_sql,
@@ -2887,8 +3022,7 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         send_telegram_alert(
             bot_token=tg_token,
             chat_id=tg_chat_id,
-            message_html=telegram_text,
-            html_file_path=html_file
+            message_html=telegram_text
         )
     else:
         print("[TELEGRAM] Warning: Telegram credentials not set. Delivery skipped.")
