@@ -11,4 +11,4 @@ python-dotenv==1.2.4
 # Shared calendar / THOR / Turso / Telegram helpers (extracted 2026-11).
 # Pinned to a tag: never track main, or a shared fix reaches production
 # without review.
-tfex-common @ git+https://github.com/met37818-stack/tfex-common.git@v0.4.0
+tfex-common @ git+https://github.com/met37818-stack/tfex-common.git@84c52f8
