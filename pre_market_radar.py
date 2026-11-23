@@ -52,6 +52,7 @@ from tfex_common.constants import (  # noqa: E402
 from tfex_common.telegram import send_alert as send_telegram_alert  # noqa: E402
 from tfex_common.thor import select_dynamic_thor_rate  # noqa: E402
 from tfex_common.thor import to_decimal_rate as _to_decimal_rate  # noqa: E402
+from tfex_common.levels import Level, LevelBook, plan_leg  # noqa: E402
 from tfex_common.report import Report, bullet  # noqa: E402
 from tfex_common.turso import execute_sql as execute_turso_sql  # noqa: E402
 from tfex_common.turso import normalize_url as normalize_turso_url  # noqa: E402
@@ -1501,24 +1502,12 @@ def generate_thai_trading_playbook(
     sl_long = min(sup_2, f_cost) if flow_kind == "trend" else sup_2
     sl_short = max(short_entry_hi, res_1 + 3.0)
 
-    def _rr(target: float, entry: float, stop: float) -> str:
-        """Risk/reward from the structural level, direction-agnostic."""
-        risk = abs(entry - stop)
-        reward = abs(target - entry)
-        if risk <= 0 or reward <= 0:
-            return "n/a"
-        return f"1:{reward / risk:.1f}"
-
-    rr_long_res = _rr(res_1, long_entry_hi, sl_long)
-    rr_long_pain = _rr(max_pain, long_entry_hi, sl_long)
-    rr_short = _rr(sup_1, short_entry_lo, sl_short)
-    rr_short_ext = _rr(long_entry_lo, short_entry_lo, sl_short)
-    long_target_text = f"เป้า <code>{res_1:.0f}</code> (R:R {rr_long_res})"
+    long_targets = [float(res_1)]
     if abs(max_pain - res_1) >= 1.0:
-        long_target_text += f" → <code>{max_pain:.0f}</code> (R:R {rr_long_pain})"
-    short_target_text = f"เป้า <code>{sup_1:.0f}</code> (R:R {rr_short})"
+        long_targets.append(float(max_pain))
+    short_targets = [float(sup_1)]
     if abs(sup_1 - long_entry_lo) >= 1.0:
-        short_target_text += f" → <code>{long_entry_lo:.1f}</code> (R:R {rr_short_ext})"
+        short_targets.append(float(long_entry_lo))
 
     if gamma_mode == "negative":
         breaks = []
@@ -1646,14 +1635,14 @@ def generate_thai_trading_playbook(
     )
 
     rep.add_measured(bullet(f"Settlement <code>{futures_ref:.1f}</code> | ATM IV {iv_cell} | 1-SD {em_text}"))
-    rep.add_measured(bullet(
-        f"ต้าน 2 <code>{res_2:.0f}</code> (OI {res_2_oi:,}) | ต้าน 1 <code>{res_1:.0f}</code> (OI {res_1_oi:,})"
-        f" | รับ 1 <code>{sup_1:.0f}</code> (OI {sup_1_oi:,}) | รับ 2 <code>{sup_2:.0f}</code> (OI {sup_2_oi:,})"
-    ))
-    rep.add_measured(bullet(
-        f"Put Wall <code>{put_wall:.0f}</code> | Call Wall <code>{call_wall:.0f}</code>"
-        f" | Max Pain <code>{max_pain:.0f}</code>"
-    ))
+    book = LevelBook(
+        res2=Level(res_2, res_2_oi), res1=Level(res_1, res_1_oi),
+        sup1=Level(sup_1, sup_1_oi), sup2=Level(sup_2, sup_2_oi),
+        put_wall=put_wall, call_wall=call_wall, max_pain=max_pain,
+    )
+    rep.add_measured(bullet(book.ladder_line()))
+    if book.walls_line():
+        rep.add_measured(bullet(book.walls_line()))
     flow_measured = (
         f"ต่างชาติ <code>{foreign_net:+,}</code> | กองทุน <code>{inst_net:+,}</code>"
         f" | รายย่อย <code>{local_net:+,}</code>"
@@ -1681,14 +1670,14 @@ def generate_thai_trading_playbook(
 
     # ---------------------------------------------------------------- plan
     rep.plan_heading = "🎯 <b>แผน (ทำเฉพาะเมื่อเงื่อนไขเกิด)</b>"
-    rep.add_plan(bullet(
-        f"🟢 <b>Long</b> | {long_style} <code>{long_entry_lo:.1f}</code>–<code>{long_entry_hi:.0f}</code>"
-        f" | Stop Loss <code>&lt;{sl_long:.0f}</code> | {long_target_text}"
-    ))
-    rep.add_plan(bullet(
-        f"🔴 <b>Short</b> | {short_style} <code>{short_entry_lo:.0f}</code>–<code>{short_entry_hi:.1f}</code>"
-        f" | Stop Loss <code>&gt;{sl_short:.1f}</code> | {short_target_text}"
-    ))
+    rep.add_plan(bullet(plan_leg(
+        "long", long_entry_lo, long_entry_hi, sl_long, long_targets,
+        style=long_style, emoji="🟢", entry_digits=1, stop_digits=0,
+    )))
+    rep.add_plan(bullet(plan_leg(
+        "short", short_entry_lo, short_entry_hi, sl_short, short_targets,
+        style=short_style, emoji="🔴", entry_digits=1, stop_digits=0,
+    )))
     rep.add_plan(bullet(f"💡 <b>โหมด:</b> {central}"))
     rep.add_plan(bullet(f"⛔ <b>ไม่เทรดเมื่อ:</b> {no_trade}"))
     if foreign_footprint and f_cost > 0:
