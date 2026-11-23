@@ -62,6 +62,20 @@ from tfex_common.turso import normalize_url as normalize_turso_url  # noqa: E402
 # Volume-profile price bucket in index points (SET50 futures tick is 0.1).
 VOLUME_PROFILE_BUCKET = 0.1
 
+# The 4-quadrant flow decomposition is driven by the SIGN of two inputs, and the
+# sign is meaningless when the number behind it is noise. A day where total futures
+# OI moves by 6 contracts out of 506,838 is not a "Short Covering" regime - it is a
+# flat tape. Anything below this share of total OI is reported as neutral so the
+# playbook cannot key its whole strategy off a rounding difference.
+FLOW_NEUTRAL_OI_PCT = 0.005          # 0.5% of total open interest
+# Same idea for the options footprint: a fixed +0.5 vol-point threshold flips a
+# strike from "accumulation" to "aggressive buying" on a 0.03 move. The threshold
+# now scales with the day's own dispersion across strikes, never below this floor.
+OPTIONS_INTENT_MIN_DIV = 0.5
+OPTIONS_INTENT_DIV_MULT = 1.5
+# Volume profile needs real history before POC/VA mean anything.
+VOLUME_PROFILE_MIN_DAYS = 5
+
 
 
 def init_analytics_tables(pipeline_url: str, auth_token: str):
@@ -379,11 +393,25 @@ def analyze_options_greeks_edge(
 # SMART MONEY FLOW DECOMPOSITION & TACTICAL STRIKE RESOLUTION
 # ==============================================================================
 
-def decompose_smart_money(foreign_net: int, delta_oi: int) -> tuple[str, str, str]:
+def decompose_smart_money(foreign_net: int, delta_oi: int, total_oi: int = None) -> tuple[str, str, str]:
     """
     Decomposes Foreign Institutional Flow and Futures Open Interest Change
     into canonical 4-quadrant derivative regimes.
+
+    total_oi makes the classification honest: a sign flip on an OI move that is
+    indistinguishable from zero is not a regime. When the change is smaller than
+    FLOW_NEUTRAL_OI_PCT of total OI the result is neutral, with the ratio spelled
+    out in the description so the reader can see why.
     """
+    if total_oi and total_oi > 0 and abs(delta_oi) < FLOW_NEUTRAL_OI_PCT * total_oi:
+        pct = abs(delta_oi) / total_oi * 100.0
+        return (
+            "Neutral / Rebalancing",
+            "⚪",
+            f"OI เปลี่ยนเพียง {delta_oi:+,} สัญญา ({pct:.3f}% ของ OI {total_oi:,}) "
+            "= ระดับ noise ตีความทิศทางไม่ได้",
+        )
+
     if foreign_net > 0 and delta_oi > 0:
         regime = "New Long Build-up"
         emoji = "🟢"
@@ -774,6 +802,31 @@ def analyze_options_footprint(
             elif otype == "P":
                 put_candidates.append(item)
 
+        # Intent threshold scales with the day's own dispersion. A fixed 0.5 vol-pt
+        # cut flipped a strike from "accumulation" to "aggressive buying" on a 0.03
+        # move; 1.5x the median |dIV| across the chain adapts to how quiet the day is.
+        _divs = sorted(abs(c["div"]) for c in (call_candidates + put_candidates) if c["div"] is not None)
+        if _divs:
+            div_threshold = max(OPTIONS_INTENT_MIN_DIV, OPTIONS_INTENT_DIV_MULT * _divs[len(_divs) // 2])
+        else:
+            div_threshold = OPTIONS_INTENT_MIN_DIV
+
+        def _intent(div_value, kind):
+            """kind: 'call' or 'put'. Never guesses from a missing dIV."""
+            if div_value is None:
+                return "IV เปลี่ยนไม่ได้ (ข้อมูลไม่พอ) — งดสรุปเจตนา"
+            if div_value > div_threshold:
+                if kind == "call":
+                    return f"Aggressive Call Buying (เก็งกำไรทะลุต้าน, ΔIV {div_value:+.2f} > เกณฑ์ {div_threshold:.2f})"
+                return f"Aggressive Put Buying / Downside Hedging (ประกันขาลง, ΔIV {div_value:+.2f} > เกณฑ์ {div_threshold:.2f})"
+            if div_value <= 0.0:
+                if kind == "call":
+                    return f"Call Writing / Cap Resistance (ล็อกแนวต้าน/เก็บพรีเมียม, ΔIV {div_value:+.2f})"
+                return f"Put Writing / Floor Support (ขาย Put ล็อกฐานแนวรับ, ΔIV {div_value:+.2f})"
+            if kind == "call":
+                return f"Call Accumulation (สะสม Call, ΔIV {div_value:+.2f} ไม่ถึงเกณฑ์ {div_threshold:.2f})"
+            return f"Put Accumulation (สะสม Put, ΔIV {div_value:+.2f} ไม่ถึงเกณฑ์ {div_threshold:.2f})"
+
         # Top Call Strike with positive delta OI
         calls_pos = [c for c in call_candidates if c["doi"] > 0]
         if calls_pos:
@@ -781,14 +834,7 @@ def analyze_options_footprint(
             top_call_strike = float(top_call["strike"])
             top_call_doi = int(top_call["doi"])
             top_call_div = top_call["div"]  # None = IV เปลี่ยนไม่ได้
-            if top_call_div is None:
-                call_intent = "IV เปลี่ยนไม่ได้ (ข้อมูลไม่พอ) — งดสรุปเจตนา"
-            elif top_call_div > 0.5:
-                call_intent = "Aggressive Call Buying (เก็งกำไรทะลุต้าน)"
-            elif top_call_div <= 0.0:
-                call_intent = "Call Writing / Cap Resistance (ล็อกแนวต้าน / เก็บพรีเมียม)"
-            else:
-                call_intent = "Call Accumulation (สะสมสัญญา Call)"
+            call_intent = _intent(top_call_div, "call")
         else:
             top_call_strike = None
             top_call_doi = 0
@@ -802,14 +848,7 @@ def analyze_options_footprint(
             top_put_strike = float(top_put["strike"])
             top_put_doi = int(top_put["doi"])
             top_put_div = top_put["div"]  # None = IV เปลี่ยนไม่ได้
-            if top_put_div is None:
-                put_intent = "IV เปลี่ยนไม่ได้ (ข้อมูลไม่พอ) — งดสรุปเจตนา"
-            elif top_put_div > 0.5:
-                put_intent = "Aggressive Put Buying / Downside Hedging (ประกันความเสี่ยงขาลงเร่งด่วน)"
-            elif top_put_div <= 0.0:
-                put_intent = "Put Writing / Floor Support (ขาย Put ล็อกฐานแนวรับ)"
-            else:
-                put_intent = "Put Accumulation (สะสมสัญญา Put)"
+            put_intent = _intent(top_put_div, "put")
         else:
             top_put_strike = None
             top_put_doi = 0
@@ -822,6 +861,7 @@ def analyze_options_footprint(
             "top_call_strike": top_call_strike,
             "top_call_doi": top_call_doi,
             "top_call_div": top_call_div,
+            "div_threshold": div_threshold,
             "call_intent": call_intent,
             "top_put_strike": top_put_strike,
             "top_put_doi": top_put_doi,
@@ -1245,9 +1285,10 @@ def analyze_late_session_flow(
 
         if not rows_fut or len(rows_fut) < 2:
             return {
-                "late_fut_delta": 0.0,
-                "late_basis_close": 0.0,
-                "late_basis_delta": 0.0,
+                "late_fut_delta": None,
+                "late_basis_close": None,
+                "late_basis_delta": None,
+                "has_data": False,
                 "late_session_desc": "⚪ ข้อมูลท้ายตลาดยังไม่เพียงพอในการตรวจจับแรงปิด"
             }
 
@@ -1278,14 +1319,16 @@ def analyze_late_session_flow(
             "late_fut_delta": float(late_fut_delta),
             "late_basis_close": float(basis_close),
             "late_basis_delta": float(late_basis_delta),
+            "has_data": True,
             "late_session_desc": late_session_desc
         }
     except Exception as e:
         print(f"[LATE_SESSION] Warning: analyze_late_session_flow failed: {e}")
         return {
-            "late_fut_delta": 0.0,
-            "late_basis_close": 0.0,
-            "late_basis_delta": 0.0,
+            "late_fut_delta": None,
+            "late_basis_close": None,
+            "late_basis_delta": None,
+            "has_data": False,
             "late_session_desc": "⚪ ไม่สามารถดึงข้อมูลช่วงท้ายตลาดได้"
         }
 
@@ -1384,98 +1427,129 @@ def generate_thai_trading_playbook(
     intraday_rv: dict = None,
     volume_profile: dict = None,
     late_session: dict = None,
-    greeks_edge: dict = None
+    greeks_edge: dict = None,
+    total_oi: int = None,
 ) -> str:
     """
-    Constructs an actionable, rule-based frontline trading plan in Thai.
-    5 Core Pillars:
-    1. 1-Day Expected Move (1-SD)
-    2. Tactical Key Levels & Quarter Walls
-    3. Intraday Structure & Realized Volatility (Warm-up 20D)
-    4. Smart Money Flow & Footprint Breakdown
-    5. Daily Action Plan & Institutional Defense Level
+    Renders the daily Thai playbook.
+
+    Design rule: the message separates what was MEASURED from what was INFERRED,
+    because a trader acting on this needs to know which numbers are facts and which
+    are model assumptions. Anything the pipeline cannot support is listed once in a
+    "ยังไม่พร้อม" line instead of being printed as 0.0 or as a confident label.
     """
     res_1 = tactical_levels["res_1"]
-    res_1_oi = tactical_levels["res_1_oi"]
+    res_1_oi = tactical_levels.get("res_1_oi", 0)
     res_2 = tactical_levels["res_2"]
-    res_2_oi = tactical_levels["res_2_oi"]
+    res_2_oi = tactical_levels.get("res_2_oi", 0)
     sup_1 = tactical_levels["sup_1"]
-    sup_1_oi = tactical_levels["sup_1_oi"]
+    sup_1_oi = tactical_levels.get("sup_1_oi", 0)
     sup_2 = tactical_levels["sup_2"]
-    sup_2_oi = tactical_levels["sup_2_oi"]
-
-    # 1. IV interpretation
-    if atm_iv is not None and atm_iv > 0:
-        if atm_iv < 0.10:
-            iv_desc = "ความผันผวนต่ำมาก ตลาดมักบีบกรอบแคบ"
-        elif atm_iv <= 0.15:
-            iv_desc = "ความผันผวนปกติ เหมาะเทรดในกรอบ"
-        else:
-            iv_desc = "ความผันผวนสูง แกว่งกว้าง ควรกระชับจุดคัต"
-        atm_iv_text = f"<code>{atm_iv * 100:.2f}%</code> <i>({iv_desc})</i>"
-    else:
-        atm_iv_text = "<i>[UNAVAILABLE - ข้อมูลราคา Options ไม่เพียงพอ]</i>"
-
-    if expected_move_1d is not None and upper_1sd is not None and lower_1sd is not None:
-        expected_move_text = f"<code>{lower_1sd:.1f}</code> – <code>{upper_1sd:.1f}</code> จุด <i>(ระยะแกว่ง ±{expected_move_1d:.1f} จุด)</i>"
-    else:
-        expected_move_text = "<i>[UNAVAILABLE - ข้อมูลราคา Options ไม่เพียงพอ]</i>"
+    sup_2_oi = tactical_levels.get("sup_2_oi", 0)
 
     f_cost = foreign_footprint.get("cost_basis", futures_ref) if foreign_footprint else futures_ref
 
-    # 2. Smart Money Translation & Actionable Playbook Logic
-    if foreign_net > 0 and delta_oi > 0:
-        flow_title = "New Long Build-up (ต่างชาติเปิดสะสม Long ใหม่)"
-        flow_detail = "ซื้อสุทธิพร้อม OI ขยายตัว เป็นการเปิด Long ใหม่หนุนตลาดขึ้น"
-        action_strategy = "Follow-Through ฝั่ง Long ตามโมเมนตัม ไม่ดักสวนเทรนด์"
-        long_plan = f"ย่อแถว รับ 1 (<code>{sup_1:.0f}</code>) ยืนได้เปิด Long เป้า <code>{res_1:.0f}</code> และ <code>{upper_1sd:.1f}</code>"
-        short_plan = f"ชะลอ Short จนกว่าจะขึ้นทดสอบ ต้าน 2 (<code>{res_2:.0f}</code>) หรือ Upper 1-SD แล้ว Rejection ไม่ผ่าน"
-        stop_loss_plan = f"ฝั่ง Long วาง Stop Loss เมื่อหลุด <code>{min(sup_2, f_cost):.0f}</code> จุด (แนว Defense ฝรั่ง)"
-    elif foreign_net > 0 and delta_oi < 0:
-        flow_title = "Short Covering (ต่างชาติปิดทำกำไร Short)"
-        flow_detail = "ซื้อสุทธิแต่ OI ลดลง เป็นแรงซื้อคืนปิด Short เดิมเพื่อลดพอร์ต"
-        action_strategy = "เน้นเล่นรอบในกรอบ (Mean Reversion) ดักย่อซื้อ-เด้งขาย ไม่ไล่ราคา"
-        long_plan = f"ตั้งรับ Lower 1-SD (<code>{lower_1sd:.1f}</code>) หรือ รับ 1 (<code>{sup_1:.0f}</code>) เป้า Max Pain (<code>{max_pain:.0f}</code>) หรือ ต้าน 1"
-        short_plan = f"เปิดกระโดดชน ต้าน 1 (<code>{res_1:.0f}</code>) หรือ Upper 1-SD (<code>{upper_1sd:.1f}</code>) ไม่ผ่าน ดัก Short เล่นรอบย่อ"
-        stop_loss_plan = f"ฝั่ง Long คัตเมื่อหลุด <code>{sup_2:.0f}</code> | ฝั่ง Short คัตเมื่อทะลุ <code>{res_1 + 3.0:.1f}</code>"
-    elif foreign_net < 0 and delta_oi > 0:
-        flow_title = "New Short Build-up (ต่างชาติเปิดสะสม Short ใหม่)"
-        flow_detail = "ขายสุทธิพร้อม OI ขยายตัว สะท้อนการเปิด Short เพิ่มเก็งกำไรขาลง"
-        action_strategy = "เน้นฝั่ง Short (Trend Expansion Down) ตามน้ำ ระวังการหลุดแนวรับแล้วรูดแรง"
-        long_plan = f"เลี่ยงดักสวนรับเร็ว จนกว่าราคาจะแตะ รับ 2 (<code>{sup_2:.0f}</code>) หรือ Lower 1-SD แล้วเกิดสัญญาณหยุดลง"
-        short_plan = f"เด้งชน ต้าน 1 (<code>{res_1:.0f}</code>) หรือ Max Pain (<code>{max_pain:.0f}</code>) ไม่ผ่าน เปิด Short เป้า <code>{sup_1:.0f}</code> และ <code>{lower_1sd:.1f}</code>"
-        stop_loss_plan = f"ฝั่ง Short วาง Stop Loss เหนือ <code>{max(res_1 + 2.5, f_cost):.1f}</code> จุด"
-    elif foreign_net < 0 and delta_oi < 0:
-        flow_title = "Long Liquidation (ต่างชาติปิดลดพอร์ต Long)"
-        flow_detail = "ขายสุทธิควบคู่ OI ลดลง เป็นการปิดสัญญาลดความเสี่ยง"
-        action_strategy = "เทรดรอบสั้นอย่างระมัดระวัง เน้นตั้งรับต่ำและไม่ไล่ราคา"
-        long_plan = f"ดักซื้อบริเวณ รับ 1 (<code>{sup_1:.0f}</code>) หรือ Lower 1-SD (<code>{lower_1sd:.1f}</code>) เล่นรีบาวด์สั้นๆ"
-        short_plan = f"เด้งไม่ผ่าน ต้าน 1 (<code>{res_1:.0f}</code>) เปิด Short เล่นรอบย่อ"
-        stop_loss_plan = f"ฝั่ง Long คัตเมื่อหลุด <code>{sup_1 - 2.0:.1f}</code> | ฝั่ง Short คัตเมื่อทะลุเหนือ <code>{res_2:.0f}</code>"
-    else:
-        flow_title = "Neutral / Rebalancing (ปรับสมดุลพอร์ต)"
-        flow_detail = "ทิศทางฟันด์โฟลว์ยังไม่ชี้นำเด่นชัด เคลื่อนไหวตามกรอบเทคนิค"
-        action_strategy = "เล่นในกรอบ รับ-ต้าน ตามปกติ"
-        long_plan = f"รับแถว <code>{sup_1:.0f}</code> จุด"
-        short_plan = f"ต้านแถว <code>{res_1:.0f}</code> จุด"
-        stop_loss_plan = f"คัตเมื่อหลุด <code>{sup_2:.0f}</code> หรือทะลุ <code>{res_2:.0f}</code>"
+    # ---------------------------------------------------------------- ready/pending
+    pending = []                     # สิ่งที่ข้อมูลยังไม่พอ — แสดงรวมบรรทัดเดียว
+    ready = 0
 
-    gamma_flip_str = f"{gamma_flip_val:.1f}" if not math.isnan(gamma_flip_val) else "N/A"
-    if not math.isnan(gamma_flip_val) and abs(futures_ref - gamma_flip_val) <= 3.0:
-        gamma_emoji = "⚖️"
-        gamma_zone_title = "Transitional Gamma (ใกล้จุดเปลี่ยนโซน)"
-        gamma_desc_compact = f"ราคาประชิด Gamma Flip ({gamma_flip_val:.1f}) เป็นจุดหมุนความผันผวน ตลาดอยู่ในช่วงเปลี่ยนผ่าน"
-    elif is_positive_gamma:
-        gamma_emoji = "🛡️"
-        gamma_zone_title = "Positive Gamma (โซนลดความผันผวน / Mean Reversion)"
-        gamma_desc_compact = f"ราคาเหนือ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Long Gamma ซับแรงเหวี่ยง พยุงตลาดแกว่งในกรอบ"
-    else:
-        gamma_emoji = "⚡"
-        gamma_zone_title = "Negative Gamma (โซนเร่งความผันผวน / Trend Expansion)"
-        gamma_desc_compact = f"ราคาใต้ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์ Short Gamma หลุดรับจะเร่งแรงขาย ระวังผันผวนขยายตัว"
+    flip_missing = gamma_flip_val is None or (isinstance(gamma_flip_val, float) and math.isnan(gamma_flip_val))
+    gamma_mode = "unknown" if flip_missing else ("positive" if is_positive_gamma else "negative")
 
-    # Format Options Greeks & Skew Edge Block
-    greeks_edge_lines = []
+    if atm_iv is not None and atm_iv > 0:
+        ready += 1
+        if atm_iv < 0.10:
+            iv_desc = "ต่ำมาก กรอบแคบ"
+        elif atm_iv <= 0.15:
+            iv_desc = "ปกติ"
+        else:
+            iv_desc = "สูง ควรกระชับจุดคัต"
+        iv_cell = f"<code>{atm_iv * 100:.2f}%</code> <i>({iv_desc})</i>"
+    else:
+        iv_cell = "<i>—</i>"
+        pending.append("ATM IV")
+    ready += 3                       # settlement + tactical levels + walls/max pain
+
+    if gamma_mode == "unknown":
+        pending.append("Gamma Flip (ไม่พบจุดตัด GEX)")
+    else:
+        ready += 1
+
+    # ---------------------------------------------------------------- flow regime
+    # Branch on the already-classified regime instead of re-deriving it from signs:
+    # the sign test alone labels a 0.001% OI move as a regime.
+    if flow_regime.startswith("New Long") or flow_regime.startswith("New Short"):
+        flow_kind = "trend"
+    elif flow_regime.startswith("Short Covering") or flow_regime.startswith("Long Liquidation"):
+        flow_kind = "reduce"
+    else:
+        flow_kind = "neutral"
+
+    oi_share = (abs(delta_oi) / total_oi * 100.0) if total_oi else None
+    oi_note = f"{delta_oi:+,} สัญญา" + (f" = {oi_share:.3f}% ของ OI" if oi_share is not None else "")
+    if flow_kind == "neutral" and oi_share is not None and oi_share < FLOW_NEUTRAL_OI_PCT * 100.0:
+        pending.append("ทิศทาง flow (OI เปลี่ยนระดับ noise)")
+    else:
+        ready += 1
+
+    # ---------------------------------------------------------------- plan skeleton
+    _l_lo = lower_1sd if lower_1sd is not None else sup_1
+    long_entry_lo, long_entry_hi = min(_l_lo, sup_1), max(_l_lo, sup_1)
+    _s_hi = upper_1sd if upper_1sd is not None else res_1 + 3.0
+    short_entry_lo, short_entry_hi = min(res_1, _s_hi), max(res_1, _s_hi)
+    sl_long = min(sup_2, f_cost) if flow_kind == "trend" else sup_2
+    sl_short = max(short_entry_hi, res_1 + 3.0)
+
+    def _rr(target: float, entry: float, stop: float) -> str:
+        """Risk/reward from the structural level, direction-agnostic."""
+        risk = abs(entry - stop)
+        reward = abs(target - entry)
+        if risk <= 0 or reward <= 0:
+            return "n/a"
+        return f"1:{reward / risk:.1f}"
+
+    rr_long_res = _rr(res_1, long_entry_hi, sl_long)
+    rr_long_pain = _rr(max_pain, long_entry_hi, sl_long)
+    rr_short = _rr(sup_1, short_entry_lo, sl_short)
+    rr_short_ext = _rr(long_entry_lo, short_entry_lo, sl_short)
+    long_target_text = f"เป้า <code>{res_1:.0f}</code> (R:R {rr_long_res})"
+    if abs(max_pain - res_1) >= 1.0:
+        long_target_text += f" → <code>{max_pain:.0f}</code> (R:R {rr_long_pain})"
+    short_target_text = f"เป้า <code>{sup_1:.0f}</code> (R:R {rr_short})"
+    if abs(sup_1 - long_entry_lo) >= 1.0:
+        short_target_text += f" → <code>{long_entry_lo:.1f}</code> (R:R {rr_short_ext})"
+
+    if gamma_mode == "negative":
+        breaks = []
+        if upper_1sd is not None:
+            breaks.append(f"เหนือ <code>{upper_1sd:.1f}</code>")
+        if lower_1sd is not None:
+            breaks.append(f"ใต้ <code>{lower_1sd:.1f}</code>")
+        break_text = (" (" + " / ".join(breaks) + ")") if breaks else ""
+        central = (
+            f"Negative Gamma: ใต้จุด Flip ดีลเลอร์ต้อง hedge ตามเทรนด์ → "
+            f"เล่นตามทิศที่เบรก{break_text} ไม่ดักสวนในกรอบ (ถ้าจะดัก ให้ลดไซส์ครึ่ง)"
+        )
+        no_trade = f"ไม่เทรดถ้าราคาแกว่งระหว่าง {sup_1:.0f}–{res_1:.0f} แคบกว่าครึ่งของ 1-SD"
+        long_style, short_style = "ดักรับ (ครึ่งไซส์)", "ดักขาย (ครึ่งไซส์)"
+    elif gamma_mode == "positive":
+        central = (
+            "Positive Gamma: ดีลเลอร์ซับแรงเหวี่ยง → Mean Reversion ในกรอบใช้ได้ "
+            "แต่ต้องรอราคาแตะขอบกรอบ"
+        )
+        no_trade = f"ไม่เทรดถ้าราคาเปิดเกิน {res_1:.0f} หรือหลุด {sup_1:.0f} ตั้งแต่เช้า"
+        long_style = short_style = "เข้า"
+    else:
+        central = "ไม่รู้โซน gamma → ใช้ระดับราคา/OI เป็นหลัก ลดไซส์และรอ confirmation"
+        no_trade = "ไม่เทรดเมื่อไม่มีสัญญาณ confirmation ที่ระดับราคา"
+        long_style = short_style = "เข้า"
+
+    # flow ที่บอกว่า "ปิดสถานะ" ไม่ควรถูกอ่านเป็นสัญญาณเดียวกับ "เปิดใหม่"
+    if flow_kind == "reduce":
+        central += " | flow วันนี้คือการปิดสถานะเดิม ไม่ใช่เปิดใหม่ ใช้เป็นข้อมูลประกอบ"
+
+    # ---------------------------------------------------------------- greeks edge
+    greeks_lines = []
     if greeks_edge and greeks_edge.get("records_count", 0) > 0:
         skew_val = greeks_edge.get("skew_25d")
         p_iv = greeks_edge.get("p_iv_pct")
@@ -1485,187 +1559,176 @@ def generate_thai_trading_playbook(
         tg_ratio = greeks_edge.get("theta_gamma_ratio", 0.0)
         d_vanna = greeks_edge.get("dealer_vanna", 0.0)
         d_charm = greeks_edge.get("dealer_charm", 0.0)
-        vanna_desc = greeks_edge.get("vanna_bias_desc", "")
-        be_rule = "แกว่ง > ค่านี้เน้น Long / แคบกว่าเน้น Short รับ Theta"
 
-        # W3: skew/IV อาจเป็น None เมื่อข้อมูลฝั่งใดฝั่งหนึ่งขาด -> ห้าม format ด้วย :.2f
         if skew_val is None or p_iv is None or c_iv is None:
-            skew_line = f"  - <b>25Δ Skew:</b> <code>N/A</code> ➔ <i>{skew_desc}</i>"
+            greeks_lines.append(f"  • 25Δ Skew: <i>N/A</i> — {skew_desc}")
         else:
-            skew_line = (f"  - <b>25Δ Skew:</b> <code>{skew_val:+.2f}%</code> "
-                         f"(Put <code>{p_iv:.1f}%</code> vs Call <code>{c_iv:.1f}%</code>) ➔ <i>{skew_desc}</i>")
+            greeks_lines.append(
+                f"  • 25Δ Skew: <code>{skew_val:+.2f}%</code> "
+                f"(Put {p_iv:.1f}% vs Call {c_iv:.1f}%) — {skew_desc}"
+            )
+        greeks_lines.append(
+            f"  • Breakeven ที่ theta หักล้าง gamma: <code>{be_move:.1f}</code> จุด/วัน "
+            f"(θ/γ {tg_ratio:.1f}) — แกว่งเกินนี้จึงคุ้มถือทิศ"
+        )
+        greeks_lines.append(
+            f"  • Dealer Vanna <code>{d_vanna:+,.0f}</code>/1%IV | Charm <code>{d_charm:+,.0f}</code>/วัน"
+            f" <i>(สมมติ: ดีลเลอร์ short OI ลูกค้าทั้งหมด)</i>"
+        )
+        ready += 1
 
-        greeks_edge_lines = [
-            f"• <b>Options Greeks & Skew Edge ({front_series}):</b>",
-            skew_line,
-            f"  - <b>ATM Breakeven Move:</b> <code>{be_move:.1f}</code> จุด/วัน (θ/γ: <code>{tg_ratio:.1f}</code>) ➔ <i>{be_rule}</i>",
-            f"  - <b>Dealer Flow:</b> Vanna <code>{d_vanna:+,.0f}</code> สัญญา/1% IV | Charm <code>{d_charm:+,.0f}</code>/วัน ➔ <i>{vanna_desc}</i>"
-        ]
-
-    # Format Intraday & Realized Volatility Block
-    if intraday_rv and volume_profile and late_session:
-        rv_ann = intraday_rv.get("rv_annualized")
-        bar_count = intraday_rv.get("bar_count", 0)
-        is_valid_rv = intraday_rv.get("is_valid_rv", bar_count >= 310)
-        vol_regime_desc = intraday_rv.get("vol_regime_desc", "N/A")
-
-        poc = volume_profile.get("poc")
-        vah = volume_profile.get("vah")
-        val = volume_profile.get("val")
-        warmup_days = volume_profile.get("warmup_days", 0)
-        valid_days = volume_profile.get("valid_days", 0)
-        confluence_text = volume_profile.get("confluence_text", "N/A")
-
-        late_fut_delta = late_session.get("late_fut_delta", 0.0)
-        late_basis_close = late_session.get("late_basis_close", 0.0)
-        late_basis_delta = late_session.get("late_basis_delta", 0.0)
-        late_session_desc = late_session.get("late_session_desc", "N/A")
-
-        if rv_ann is not None:
-            if atm_iv is not None:
-                rv_section_line = f"• <b>RV vs IV:</b> RV <code>{rv_ann * 100:.2f}%</code> vs ATM IV <code>{atm_iv * 100:.2f}%</code> ({bar_count} บาร์) ➔ <i>{vol_regime_desc}</i>"
-            else:
-                rv_section_line = f"• <b>RV vs IV:</b> RV <code>{rv_ann * 100:.2f}%</code> ({bar_count} บาร์) ➔ <i>{vol_regime_desc}</i>"
-        else:
-            rv_section_line = f"• <b>RV vs IV:</b> ⏳ <i>[INSUFFICIENT FUTURES DATA] ({bar_count}/10 บาร์) — งดคำนวณ RV</i>"
-
-        if poc is None or vah is None or val is None:
-            profile_line = f"• <b>Volume Profile:</b> <i>[NO INTRADAY VOLUME DATA]</i>"
-        elif valid_days < 5:
-            profile_line = f"• <b>Volume Profile:</b> POC <code>{poc:.0f}</code> | VA: <code>{val:.0f}</code>–<code>{vah:.0f}</code> (<i>⚠️ สะสม {valid_days}/20 วัน</i>)"
-        else:
-            profile_line = f"• <b>Volume Profile:</b> POC <code>{poc:.0f}</code> | VA: <code>{val:.0f}</code>–<code>{vah:.0f}</code> ➔ <i>{confluence_text}</i>"
-
-        late_line = f"• <b>ท้ายตลาด (16:30–16:55):</b> Fut <code>{late_fut_delta:+.1f}</code> | Basis <code>{late_basis_close:+.2f}</code> (Δ<code>{late_basis_delta:+.2f}</code>) ➔ <i>{late_session_desc}</i>"
-
-        sec3_lines = [
-            f"📊 <b>3. โครงสร้างความผันผวน & Intraday (Warm-up: {valid_days}/20 วัน)</b>"
-        ]
-        if greeks_edge_lines:
-            sec3_lines.extend(greeks_edge_lines)
-        sec3_lines.append(rv_section_line)
-        sec3_lines.append(profile_line)
-        sec3_lines.append(late_line)
-        intraday_block = "\n".join(sec3_lines)
-    else:
-        if greeks_edge_lines:
-            intraday_block = f"📊 <b>3. โครงสร้าง Options Greeks ({front_series})</b>\n" + "\n".join(greeks_edge_lines)
-        else:
-            intraday_block = ""
-
-    # Format Foreign Footprint
-    if foreign_footprint:
-        f_cum = foreign_footprint.get("cum_foreign_net", 0)
-        f_pnl_status = foreign_footprint.get("pnl_status", "N/A")
-        f_z_desc = foreign_footprint.get("z_desc", "N/A")
-        f_div_text = foreign_footprint.get("divergence_text", "N/A")
-        f_days = foreign_footprint.get("history_days", 60)
-        foreign_footprint_block = f"""• <b>ต่างชาติสะสม ({f_days}D):</b> <code>{f_cum:+,}</code> สัญญา | ทุนเฉลี่ย: <code>{f_cost:.1f}</code> จุด <i>({f_pnl_status})</i>
-  - Z-Score: {f_z_desc} | {f_div_text}"""
-    else:
-        foreign_footprint_block = ""
-
-    # Format Options Footprint
+    # ---------------------------------------------------------------- footprint
+    footprint_lines = []
     if options_footprint:
-        o_c_net = options_footprint.get("foreign_call_net", 0)
-        o_p_net = options_footprint.get("foreign_put_net", 0)
+        thr = options_footprint.get("div_threshold")
         top_c_k = options_footprint.get("top_call_strike")
         top_c_doi = options_footprint.get("top_call_doi", 0)
-        c_intent = options_footprint.get("call_intent", "ไม่มีนัยสำคัญ")
-
+        c_intent = options_footprint.get("call_intent", "")
         top_p_k = options_footprint.get("top_put_strike")
         top_p_doi = options_footprint.get("top_put_doi", 0)
-        p_intent = options_footprint.get("put_intent", "ไม่มีนัยสำคัญ")
-
+        p_intent = options_footprint.get("put_intent", "")
         if top_c_k is not None and top_c_doi > 0:
-            call_line = f"Call <code>{top_c_k:.0f}</code> (ΔOI: <code>{top_c_doi:+,}</code>) ➔ <i>{c_intent}</i>"
-        else:
-            call_line = f"Call: <i>{c_intent}</i>"
-
+            footprint_lines.append(f"  • Call {top_c_k:.0f} ΔOI {top_c_doi:+,} → {c_intent}")
         if top_p_k is not None and top_p_doi > 0:
-            put_line = f"Put <code>{top_p_k:.0f}</code> (ΔOI: <code>{top_p_doi:+,}</code>) ➔ <i>{p_intent}</i>"
+            footprint_lines.append(f"  • Put {top_p_k:.0f} ΔOI {top_p_doi:+,} → {p_intent}")
+        if thr is not None and footprint_lines:
+            footprint_lines.append(f"  <i>เกณฑ์ ΔIV วันนี้: {thr:.2f} vol pts (ปรับตามการกระจายของทั้ง chain)</i>")
+
+    # ---------------------------------------------------------------- thin sections
+    rv_line = None
+    if intraday_rv:
+        bar_count = intraday_rv.get("bar_count", 0)
+        rv_ann = intraday_rv.get("rv_annualized")
+        if rv_ann is None or bar_count < 10:
+            pending.append(f"RV vs IV ({bar_count}/10 บาร์)")
         else:
-            put_line = f"Put: <i>{p_intent}</i>"
+            ready += 1
+            iv_ref = f" vs ATM IV <code>{atm_iv * 100:.2f}%</code>" if atm_iv else ""
+            rv_line = (
+                f"  • RV <code>{rv_ann * 100:.2f}%</code>{iv_ref}"
+                f" ({bar_count} บาร์) — {intraday_rv.get('vol_regime_desc', '')}"
+            )
 
-        options_footprint_block = f"""• <b>Options Footprint:</b> Call <code>{o_c_net:+,}</code> | Put <code>{o_p_net:+,}</code> สัญญา
-  - {call_line}
-  - {put_line}"""
-    else:
-        options_footprint_block = ""
+    profile_line = None
+    if volume_profile:
+        valid_days = volume_profile.get("valid_days", 0)
+        poc, vah, val = volume_profile.get("poc"), volume_profile.get("vah"), volume_profile.get("val")
+        if poc is None or vah is None or val is None or valid_days < VOLUME_PROFILE_MIN_DAYS:
+            pending.append(f"Volume Profile ({valid_days}/20 วัน, ต้องการ ≥{VOLUME_PROFILE_MIN_DAYS})")
+        else:
+            ready += 1
+            profile_line = (
+                f"  • Volume Profile {valid_days} วัน: POC <code>{poc:.0f}</code> | "
+                f"VA <code>{val:.0f}–{vah:.0f}</code> — {volume_profile.get('confluence_text', '')}"
+            )
 
-    # Format Institutional Cost Narrative for Action Plan
+    late_line = None
+    if late_session:
+        if not late_session.get("has_data", True):
+            pending.append("Late Session (16:30–16:55 ไม่มีบาร์)")
+        else:
+            ready += 1
+            late_line = (
+                f"  • ท้ายตลาด 16:30–16:55: Fut <code>{late_session['late_fut_delta']:+.1f}</code> | "
+                f"Basis <code>{late_session['late_basis_close']:+.2f}</code>"
+                f" (Δ{late_session['late_basis_delta']:+.2f}) — {late_session.get('late_session_desc', '')}"
+            )
+
+    # ---------------------------------------------------------------- measured block
+    em_text = (f"<code>{lower_1sd:.1f}</code>–<code>{upper_1sd:.1f}</code> (±{expected_move_1d:.1f})"
+               if expected_move_1d is not None else "<i>—</i>")
+    measured = [
+        f"  • Settlement <code>{futures_ref:.1f}</code> | ATM IV {iv_cell} | 1-SD {em_text}",
+        f"  • ต้าน 2 <code>{res_2:.0f}</code> (OI {res_2_oi:,}) | ต้าน 1 <code>{res_1:.0f}</code> (OI {res_1_oi:,})"
+        f" | รับ 1 <code>{sup_1:.0f}</code> (OI {sup_1_oi:,}) | รับ 2 <code>{sup_2:.0f}</code> (OI {sup_2_oi:,})",
+        f"  • Put Wall <code>{put_wall:.0f}</code> | Call Wall <code>{call_wall:.0f}</code> | Max Pain <code>{max_pain:.0f}</code>",
+        (f"  • ต่างชาติ <code>{foreign_net:+,}</code> | กองทุน <code>{inst_net:+,}</code> | รายย่อย <code>{local_net:+,}</code>"
+         f" | OI รวม <code>{total_oi:,}</code> (Δ {oi_note})" if total_oi else
+         f"  • ต่างชาติ <code>{foreign_net:+,}</code> | กองทุน <code>{inst_net:+,}</code> | รายย่อย <code>{local_net:+,}</code>"),
+    ]
+    for extra in (rv_line, profile_line, late_line):
+        if extra:
+            measured.append(extra)
+
+    # ---------------------------------------------------------------- inferred block
+    gamma_cell = {
+        "negative": f"⚡ Negative Gamma — ใต้ Gamma Flip <code>{gamma_flip_val:.1f}</code>",
+        "positive": f"🛡️ Positive Gamma — เหนือ Gamma Flip <code>{gamma_flip_val:.1f}</code>",
+        "unknown": "❔ ไม่ทราบโซน Gamma (ไม่พบจุด Flip ในกรอบที่ประเมิน) — งดใช้ gamma เป็นเหตุผล",
+    }[gamma_mode]
+
+    inferred = [
+        f"  • <b>Flow:</b> {flow_emoji} {flow_regime} — <i>{flow_kind_text(flow_kind)}</i>",
+        f"  • <b>Dealer Gamma:</b> {gamma_cell} <i>(สมมติ: ดีลเลอร์ short OI ลูกค้า)</i>",
+    ]
+    inferred.extend(greeks_lines)
+    inferred.extend(footprint_lines)
+
+    # ---------------------------------------------------------------- assemble
+    header_meta = f"ข้อมูลพร้อม {ready} ส่วน"
+    if pending:
+        header_meta += f" · ยังไม่พร้อม {len(pending)}"
+    head = (
+        f"📊 <b>SET50 · {front_series} · ข้อมูลสิ้นวัน {trade_date}</b>\n"
+        f"🕖 <i>ออกรายงาน {as_of_time_bkk} น. | {header_meta}</i>"
+    )
+    plan_block = (
+        f"🎯 <b>แผน (ทำเฉพาะเมื่อเงื่อนไขเกิด)</b>\n"
+        f"  🟢 <b>Long</b> | {long_style} <code>{long_entry_lo:.1f}</code>–<code>{long_entry_hi:.0f}</code>"
+        f" | Stop Loss <code>&lt;{sl_long:.0f}</code>"
+        f" | {long_target_text}\n"
+        f"  🔴 <b>Short</b> | {short_style} <code>{short_entry_lo:.0f}</code>–<code>{short_entry_hi:.1f}</code>"
+        f" | Stop Loss <code>&gt;{sl_short:.1f}</code>"
+        f" | {short_target_text}\n"
+        f"  💡 <b>โหมด:</b> {central}\n"
+        f"  ⛔ <b>ไม่เทรดเมื่อ:</b> {no_trade}"
+    )
     if foreign_footprint and f_cost > 0:
         cum_f = foreign_footprint.get("cum_foreign_net", 0)
-        if cum_f < 0:
-            if futures_ref < f_cost:
-                pnl = f_cost - futures_ref
-                cost_relation = f"ต่างชาติกำไร Short (+{pnl:.1f} จุด) แนว {f_cost:.1f} เป็นต้านต้นทุน ไม่ผ่านระวังแรงกดซ้ำ ทะลุระวัง Squeeze"
-            else:
-                loss = futures_ref - f_cost
-                cost_relation = f"ต่างชาติติดลบ Short (-{loss:.1f} จุด) เหนือแนวต้าน {f_cost:.1f} ระวัง Short Squeeze เร่งแรงดีด"
-        elif cum_f > 0:
-            if futures_ref >= f_cost:
-                pnl = futures_ref - f_cost
-                cost_relation = f"ต่างชาติกำไร Long (+{pnl:.1f} จุด) แนว {f_cost:.1f} เป็นแนวรับจิตวิทยา (Defense Line)"
-            else:
-                loss = f_cost - futures_ref
-                cost_relation = f"ต่ำกว่าทุนฝรั่ง ({f_cost:.1f}) ต่างชาติขาดทุน Long (-{loss:.1f} จุด) ระวังแรงขายลดเสี่ยงเมื่อชนทุน"
-        else:
-            cost_relation = f"ต้นทุนเฉลี่ยฝรั่ง {f_cost:.1f} จุด (สะสมใกล้เคียงศูนย์)"
+        side = "Short" if cum_f < 0 else "Long"
+        pnl = (f_cost - futures_ref) if cum_f < 0 else (futures_ref - f_cost)
+        plan_block += (
+            f"\n  🏦 <b>ทุนต่างชาติ {foreign_footprint.get('history_days', 60)}D:</b> "
+            f"<code>{f_cost:.1f}</code> จุด ({side} กำไร {pnl:+.1f} จุด) — "
+            "ใช้เป็นแนวปะทะ ไม่ใช่เป้าหมาย"
+        )
 
-        cost_narrative = f"""• <b>แนวปะทะต้นทุนสถาบัน (Cost Line):</b> <code>{f_cost:.1f}</code> จุด
-  <i>({cost_relation})</i>
-"""
-    else:
-        cost_narrative = ""
+    watch = []
+    if gamma_mode != "unknown":
+        watch.append(f"ปิด{'เหนือ' if gamma_mode == 'negative' else 'ใต้'} <code>{gamma_flip_val:.1f}</code> (gamma เปลี่ยนโซน)")
+    if total_oi and oi_share is not None:
+        watch.append(f"OI เปลี่ยนเกิน {FLOW_NEUTRAL_OI_PCT * 100:.1f}% ของ OI (วันนี้ {oi_share:.3f}%)")
+    watch.append(f"หลุด <code>{sup_2:.0f}</code> หรือทะลุ <code>{res_2:.0f}</code> (กรอบเดิมพัง)")
 
-    # Assemble Sections 3 and 4 cleanly
-    sec4_lines = [
-        "🌊 <b>4. พฤติกรรมรายใหญ่ (Smart Money Flow & Footprint)</b>",
-        f"• <b>สถานะ Flow:</b> {flow_emoji} <b>{flow_title}</b>",
-        f"  <i>({flow_detail})</i>",
-        f"• <b>ยอดซื้อขายรายกลุ่ม:</b> ต่างชาติ <code>{foreign_net:+,}</code> (ΔOI: <code>{delta_oi:+,}</code>) | กองทุน <code>{inst_net:+,}</code> | รายย่อย <code>{local_net:+,}</code>"
+    parts = [
+        head,
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "📏 <b>วัดได้ (ข้อมูลจริงจาก TFEX)</b>",
+        "\n".join(measured),
+        "",
+        "🧠 <b>อนุมาน (มีสมมติฐาน — ไม่ใช่ข้อมูลดิบ)</b>",
+        "\n".join(inferred),
+        "",
+        plan_block,
     ]
-    if foreign_footprint_block:
-        sec4_lines.append(foreign_footprint_block)
-    if options_footprint_block:
-        sec4_lines.append(options_footprint_block)
-    sec4_text = "\n".join(sec4_lines)
+    if pending:
+        parts.extend(["", "⏳ <b>ยังไม่พร้อม:</b> " + " · ".join(pending)])
+    parts.extend([
+        "",
+        "🔁 <b>เปลี่ยนมุมมองเมื่อ:</b> " + " · ".join(watch),
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        '🌐 <b>กราฟ:</b> <a href="https://met37818-stack.github.io/tfex-quant-analytics/">เปิดใน Chrome</a>',
+    ])
+    return "\n".join(parts)
 
-    body_blocks = []
-    if intraday_block:
-        body_blocks.append(intraday_block.strip())
-    if sec4_text:
-        body_blocks.append(sec4_text.strip())
-    body_content = "\n\n".join(body_blocks)
 
-    msg = f"""🎯 <b>แผนการเทรด SET50 ประจำวัน | TFEX QUANT RADAR</b>
-📅 <i>ข้อมูลสิ้นวัน {trade_date} | ออกรายงานเช้า {as_of_time_bkk} น.</i>
-━━━━━━━━━━━━━━━━━━━━━━
-🎯 <b>1. กรอบวิ่งคาดการณ์ (1-Day Expected Move)</b>
-• <b>กรอบราคา 1-SD:</b> {expected_move_text}
-• <b>ระดับความผันผวน (ATM IV):</b> {atm_iv_text}
+def flow_kind_text(kind: str) -> str:
+    return {
+        "trend": "เปิดสถานะใหม่ตามทิศ — ใช้ได้เฉพาะเมื่อ OI เปลี่ยนเกินเกณฑ์",
+        "reduce": "ปิดสถานะเดิม — สัญญาณอ่อนกว่าเปิดใหม่ ใช้ประกอบเท่านั้น",
+        "range": "ไม่ชี้นำ — ใช้ระดับราคา/OI เป็นหลัก",
+    }.get(kind, "ไม่ชี้นำ")
 
-🧱 <b>2. แนวรับ - แนวต้านสำคัญ (Tactical Key Levels)</b>
-🔴 <b>ต้าน 2:</b> <code>{res_2:.0f}</code> <i>({res_2_oi:,})</i> | <b>ต้าน 1:</b> <code>{res_1:.0f}</code> <i>({res_1_oi:,})</i>
-📍 <b>ราคาปิดล่าสุด ({front_series}):</b> <code>{futures_ref:.1f}</code> จุด <i>(Max Pain: <code>{max_pain:.0f}</code>)</i>
-🟢 <b>รับ 1:</b> <code>{sup_1:.0f}</code> <i>({sup_1_oi:,})</i> | <b>รับ 2:</b> <code>{sup_2:.0f}</code> <i>({sup_2_oi:,})</i>
-───────────────
-🏛️ <i>กรอบไตรมาส: Put Wall <code>{put_wall:.0f}</code> – Call Wall <code>{call_wall:.0f}</code> | Gamma Flip: <code>{gamma_flip_str}</code></i>
-
-{body_content}
-
-⚔️ <b>5. กลยุทธ์และแผนการเทรด (Daily Action Plan)</b>
-• <b>สภาวะตลาด (Dealer Gamma):</b> {gamma_emoji} <b>{gamma_zone_title}</b>
-  <i>({gamma_desc_compact})</i>
-{cost_narrative}• <b>แผนการปฏิบัติหน้างาน:</b>
-  💡 <b>กลยุทธ์หลัก:</b> {action_strategy}
-  🟢 <b>ฝั่ง Long:</b> {long_plan}
-  🔴 <b>ฝั่ง Short:</b> {short_plan}
-  ⚠️ <b>จุดตัดขาดทุน (Stop Loss):</b> {stop_loss_plan}
-━━━━━━━━━━━━━━━━━━━━━━
-🌐 <b>เปิดดูกราฟ Interactive:</b> <a href="https://met37818-stack.github.io/tfex-quant-analytics/">คลิกเปิดใน Chrome ทันที</a>"""
-    return msg
 
 # ==============================================================================
 # VISUALIZATION & CHART GENERATION (PLOTLY INTERACTIVE DASHBOARD)
@@ -2076,9 +2139,10 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         tactical_levels = resolve_tactical_levels(res_df, futures_ref, call_wall, put_wall)
         foreign_net = 3500
         delta_oi = -4200
+        tot_oi_0 = 480000
         inst_net = -1200
         local_net = -2300
-        flow_regime, flow_emoji, flow_desc = decompose_smart_money(foreign_net, delta_oi)
+        flow_regime, flow_emoji, flow_desc = decompose_smart_money(foreign_net, delta_oi, tot_oi_0)
 
         # Mock Footprint Analytics for Phase 1
         mock_series_data = []
@@ -2188,7 +2252,8 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
             intraday_rv=mock_intraday_rv,
             volume_profile=mock_volume_profile,
             late_session=mock_late_session,
-            greeks_edge=mock_greeks_edge
+            greeks_edge=mock_greeks_edge,
+            total_oi=tot_oi_0,
         )
 
         print("\n" + "=" * 75)
@@ -2467,14 +2532,26 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
     if flip_candidates:
         # Pick zero-crossing closest to futures_ref
         gamma_flip_val = float(min(flip_candidates, key=lambda x: abs(x - futures_ref)))
+        flip_available = True
     else:
-        # Fallback to max_pain if no zero-crossing in active range
-        gamma_flip_val = float(max_pain)
+        # No zero-crossing in the evaluated range means we do not know where dealer
+        # gamma flips. The old code substituted max_pain here and printed it as
+        # "Gamma Flip", which silently turned a support magnet into a hedging level.
+        gamma_flip_val = float("nan")
+        flip_available = False
 
     total_net_gex = float(res_df["net_gex_mb"].sum())
 
-    # Consistent Gamma Regime: Aligned with current price position relative to Gamma Flip
-    if not math.isnan(gamma_flip_val) and abs(futures_ref - gamma_flip_val) <= 3.0:
+    # Gamma regime: unknown is its own state, never a silent positive/negative guess.
+    if not flip_available:
+        is_positive_gamma = None
+        gamma_zone_title = "Gamma Regime ไม่ชัด (ไม่มีจุด Flip ในกรอบราคาที่ประเมิน)"
+        gamma_desc = (
+            f"ไม่พบจุดตัด Net GEX ในกรอบราคาที่ประเมิน จึงไม่สามารถบอกได้ว่าดีลเลอร์ "
+            f"Long หรือ Short Gamma (Net GEX รวม {total_net_gex:+.2f} MB/pt) — "
+            "งดใช้ gamma เป็นเหตุผลในการเข้าเทรด"
+        )
+    elif abs(futures_ref - gamma_flip_val) <= 3.0:
         is_positive_gamma = (futures_ref >= gamma_flip_val)
         gamma_zone_title = "Neutral / Transitional Gamma (ใกล้จุดเปลี่ยนโซน)"
         gamma_desc = f"ราคาประชิด Gamma Flip ({gamma_flip_val:.1f}) เป็นจุดหมุนความผันผวน ตลาดอยู่ในช่วงเปลี่ยนผ่าน เหมาะเทรดในกรอบ (Mean Reversion)"
@@ -2487,7 +2564,7 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         gamma_zone_title = "Negative Gamma (โซนเร่งความผันผวน / Trend Expansion)"
         gamma_desc = f"ราคาปัจจุบัน ({futures_ref:.1f}) อยู่ใต้ Gamma Flip ({gamma_flip_val:.1f}) ดีลเลอร์อยู่ในสถานะ Short Gamma (ต้องเปิด Hedging ตามแนวโน้ม) หากหลุดแนวรับจะเร่งแรงขายซ้ำเติม ทำให้เกิดความผันผวนสูง"
 
-    gamma_regime = "Positive Gamma" if is_positive_gamma else "Negative Gamma"
+    gamma_regime = "Positive Gamma" if is_positive_gamma else ("Negative Gamma" if is_positive_gamma is False else "Unknown Gamma")
 
     # 6.1 Resolve Nearest Tactical Levels (Spot ± 25)
     tactical_levels = resolve_tactical_levels(res_df, futures_ref, call_wall, put_wall)
@@ -2544,7 +2621,7 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         delta_oi = tot_oi_0 - tot_oi_prev
         tot_vol_0 = 0
 
-    flow_regime, flow_emoji, flow_desc = decompose_smart_money(foreign_net, delta_oi)
+    flow_regime, flow_emoji, flow_desc = decompose_smart_money(foreign_net, delta_oi, tot_oi_0)
     print(f"[FLOW] Foreign Net Flow : {foreign_net:+,} contracts")
     print(f"[FLOW] Total Futures OI : {tot_oi_0:,} (Change: {delta_oi:+,} contracts)")
     print(f"[FLOW] Smart Money State: {flow_emoji} {flow_regime} ({flow_desc})")
@@ -2718,7 +2795,8 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         intraday_rv=intraday_rv,
         volume_profile=volume_profile,
         late_session=late_session,
-        greeks_edge=greeks_edge
+        greeks_edge=greeks_edge,
+        total_oi=tot_oi_0,
     )
 
     # 10. Persist Log to Turso Database
