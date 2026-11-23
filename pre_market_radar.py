@@ -1535,54 +1535,6 @@ def generate_thai_trading_playbook(
         long_style = short_style = "เข้า"
 
     # flow ที่บอกว่า "ปิดสถานะ" ไม่ควรถูกอ่านเป็นสัญญาณเดียวกับ "เปิดใหม่"
-    if flow_kind == "reduce":
-        central += " | flow วันนี้คือการปิดสถานะเดิม ไม่ใช่เปิดใหม่ ใช้เป็นข้อมูลประกอบ"
-
-    # ---------------------------------------------------------------- greeks edge
-    greeks_lines = []
-    if greeks_edge and greeks_edge.get("records_count", 0) > 0:
-        skew_val = greeks_edge.get("skew_25d")
-        p_iv = greeks_edge.get("p_iv_pct")
-        c_iv = greeks_edge.get("c_iv_pct")
-        skew_desc = greeks_edge.get("skew_desc", "สมดุล")
-        be_move = greeks_edge.get("daily_breakeven_move", 0.0)
-        tg_ratio = greeks_edge.get("theta_gamma_ratio", 0.0)
-        d_vanna = greeks_edge.get("dealer_vanna", 0.0)
-        d_charm = greeks_edge.get("dealer_charm", 0.0)
-
-        if skew_val is None or p_iv is None or c_iv is None:
-            greeks_lines.append(f"  • 25Δ Skew: <i>N/A</i> — {skew_desc}")
-        else:
-            greeks_lines.append(
-                f"  • 25Δ Skew: <code>{skew_val:+.2f}%</code> "
-                f"(Put {p_iv:.1f}% vs Call {c_iv:.1f}%) — {skew_desc}"
-            )
-        greeks_lines.append(
-            f"  • Breakeven ที่ theta หักล้าง gamma: <code>{be_move:.1f}</code> จุด/วัน "
-            f"(θ/γ {tg_ratio:.1f}) — แกว่งเกินนี้จึงคุ้มถือทิศ"
-        )
-        greeks_lines.append(
-            f"  • Dealer Vanna <code>{d_vanna:+,.0f}</code>/1%IV | Charm <code>{d_charm:+,.0f}</code>/วัน"
-            f" <i>(สมมติ: ดีลเลอร์ short OI ลูกค้าทั้งหมด)</i>"
-        )
-        ready += 1
-
-    # ---------------------------------------------------------------- footprint
-    footprint_lines = []
-    if options_footprint:
-        thr = options_footprint.get("div_threshold")
-        top_c_k = options_footprint.get("top_call_strike")
-        top_c_doi = options_footprint.get("top_call_doi", 0)
-        c_intent = options_footprint.get("call_intent", "")
-        top_p_k = options_footprint.get("top_put_strike")
-        top_p_doi = options_footprint.get("top_put_doi", 0)
-        p_intent = options_footprint.get("put_intent", "")
-        if top_c_k is not None and top_c_doi > 0:
-            footprint_lines.append(f"  • Call {top_c_k:.0f} ΔOI {top_c_doi:+,} → {c_intent}")
-        if top_p_k is not None and top_p_doi > 0:
-            footprint_lines.append(f"  • Put {top_p_k:.0f} ΔOI {top_p_doi:+,} → {p_intent}")
-        if thr is not None and footprint_lines:
-            footprint_lines.append(f"  <i>เกณฑ์ ΔIV วันนี้: {thr:.2f} vol pts (ปรับตามการกระจายของทั้ง chain)</i>")
 
     # ---------------------------------------------------------------- thin sections
     rv_line = None
@@ -1609,7 +1561,7 @@ def generate_thai_trading_playbook(
             ready += 1
             profile_line = (
                 f"  • Volume Profile {valid_days} วัน: POC <code>{poc:.0f}</code> | "
-                f"VA <code>{val:.0f}–{vah:.0f}</code> — {volume_profile.get('confluence_text', '')}"
+                f"VA <code>{val:.0f}–{vah:.0f}</code>"
             )
 
     late_line = None
@@ -1621,38 +1573,42 @@ def generate_thai_trading_playbook(
             late_line = (
                 f"  • ท้ายตลาด 16:30–16:55: Fut <code>{late_session['late_fut_delta']:+.1f}</code> | "
                 f"Basis <code>{late_session['late_basis_close']:+.2f}</code>"
-                f" (Δ{late_session['late_basis_delta']:+.2f}) — {late_session.get('late_session_desc', '')}"
+                f" (Δ{late_session['late_basis_delta']:+.2f})"
             )
 
     # ---------------------------------------------------------------- measured block
     em_text = (f"<code>{lower_1sd:.1f}</code>–<code>{upper_1sd:.1f}</code> (±{expected_move_1d:.1f})"
                if expected_move_1d is not None else "<i>—</i>")
     rep = Report(
-        title=f"SET50 · {front_series} · ข้อมูลสิ้นวัน {trade_date}",
+        title=f"SET50 · {front_series} · {trade_date}",
         subtitle=f"ออกรายงาน {as_of_time_bkk} น.",
         ready_sections=ready,
         footer='🌐 <b>กราฟ:</b> <a href="https://met37818-stack.github.io/tfex-quant-analytics/">เปิดใน Chrome</a>',
+        icon="",
+        measured_heading=None,
+        show_divider=False,
     )
 
-    rep.add_measured(bullet(f"Settlement <code>{futures_ref:.1f}</code> | ATM IV {iv_cell} | 1-SD {em_text}"))
+    rep.add_measured(f"📏 Fut <b>{futures_ref:.1f}</b> · ATM IV {iv_cell} · 1-SD {em_text}")
     book = LevelBook(
         res2=Level(res_2, res_2_oi), res1=Level(res_1, res_1_oi),
         sup1=Level(sup_1, sup_1_oi), sup2=Level(sup_2, sup_2_oi),
         put_wall=put_wall, call_wall=call_wall, max_pain=max_pain,
     )
-    rep.add_measured(bullet(book.ladder_line()))
+    ladder = book.ladder_line()
     if book.walls_line():
-        rep.add_measured(bullet(book.walls_line()))
+        ladder += " · " + book.walls_line()
+    rep.add_measured(f"📏 {ladder}")
     flow_measured = (
-        f"ต่างชาติ <code>{foreign_net:+,}</code> | กองทุน <code>{inst_net:+,}</code>"
-        f" | รายย่อย <code>{local_net:+,}</code>"
+        f"ต่างชาติ <b>{foreign_net:+,}</b> · กองทุน <b>{inst_net:+,}</b> · "
+        f"รายย่อย <b>{local_net:+,}</b>"
     )
     if total_oi:
-        flow_measured += f" | OI รวม <code>{total_oi:,}</code> (Δ {oi_note})"
-    rep.add_measured(bullet(flow_measured))
+        flow_measured += f" · OI {total_oi:,} (Δ {oi_note})"
+    rep.add_measured(f"📏 {flow_measured}")
     for extra in (rv_line, profile_line, late_line):
         if extra:
-            rep.add_measured(extra)
+            rep.add_measured("📏 " + extra.strip().lstrip("•").strip())
 
     # ---------------------------------------------------------------- inferred block
     gamma_cell = {
@@ -1665,8 +1621,6 @@ def generate_thai_trading_playbook(
     rep.add_inferred(bullet(
         f"<b>Dealer Gamma:</b> {gamma_cell} <i>(สมมติ: ดีลเลอร์ short OI ลูกค้า)</i>"
     ))
-    for line in greeks_lines + footprint_lines:
-        rep.add_inferred(line)
 
     # ---------------------------------------------------------------- plan
     rep.plan_heading = "🎯 <b>แผน (ทำเฉพาะเมื่อเงื่อนไขเกิด)</b>"
@@ -1680,14 +1634,6 @@ def generate_thai_trading_playbook(
     )))
     rep.add_plan(bullet(f"💡 <b>โหมด:</b> {central}"))
     rep.add_plan(bullet(f"⛔ <b>ไม่เทรดเมื่อ:</b> {no_trade}"))
-    if foreign_footprint and f_cost > 0:
-        cum_f = foreign_footprint.get("cum_foreign_net", 0)
-        side = "Short" if cum_f < 0 else "Long"
-        pnl = (f_cost - futures_ref) if cum_f < 0 else (futures_ref - f_cost)
-        rep.add_plan(bullet(
-            f"🏦 <b>ทุนต่างชาติ {foreign_footprint.get('history_days', 60)}D:</b> "
-            f"<code>{f_cost:.1f}</code> จุด ({side} กำไร {pnl:+.1f} จุด) — ใช้เป็นแนวปะทะ ไม่ใช่เป้าหมาย"
-        ))
 
     for item in pending:
         rep.add_pending(item)
