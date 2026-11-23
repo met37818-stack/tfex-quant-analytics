@@ -52,6 +52,7 @@ from tfex_common.constants import (  # noqa: E402
 from tfex_common.telegram import send_alert as send_telegram_alert  # noqa: E402
 from tfex_common.thor import select_dynamic_thor_rate  # noqa: E402
 from tfex_common.thor import to_decimal_rate as _to_decimal_rate  # noqa: E402
+from tfex_common.report import Report, bullet  # noqa: E402
 from tfex_common.turso import execute_sql as execute_turso_sql  # noqa: E402
 from tfex_common.turso import normalize_url as normalize_turso_url  # noqa: E402
 
@@ -1637,18 +1638,32 @@ def generate_thai_trading_playbook(
     # ---------------------------------------------------------------- measured block
     em_text = (f"<code>{lower_1sd:.1f}</code>–<code>{upper_1sd:.1f}</code> (±{expected_move_1d:.1f})"
                if expected_move_1d is not None else "<i>—</i>")
-    measured = [
-        f"  • Settlement <code>{futures_ref:.1f}</code> | ATM IV {iv_cell} | 1-SD {em_text}",
-        f"  • ต้าน 2 <code>{res_2:.0f}</code> (OI {res_2_oi:,}) | ต้าน 1 <code>{res_1:.0f}</code> (OI {res_1_oi:,})"
-        f" | รับ 1 <code>{sup_1:.0f}</code> (OI {sup_1_oi:,}) | รับ 2 <code>{sup_2:.0f}</code> (OI {sup_2_oi:,})",
-        f"  • Put Wall <code>{put_wall:.0f}</code> | Call Wall <code>{call_wall:.0f}</code> | Max Pain <code>{max_pain:.0f}</code>",
-        (f"  • ต่างชาติ <code>{foreign_net:+,}</code> | กองทุน <code>{inst_net:+,}</code> | รายย่อย <code>{local_net:+,}</code>"
-         f" | OI รวม <code>{total_oi:,}</code> (Δ {oi_note})" if total_oi else
-         f"  • ต่างชาติ <code>{foreign_net:+,}</code> | กองทุน <code>{inst_net:+,}</code> | รายย่อย <code>{local_net:+,}</code>"),
-    ]
+    rep = Report(
+        title=f"SET50 · {front_series} · ข้อมูลสิ้นวัน {trade_date}",
+        subtitle=f"ออกรายงาน {as_of_time_bkk} น.",
+        ready_sections=ready,
+        footer='🌐 <b>กราฟ:</b> <a href="https://met37818-stack.github.io/tfex-quant-analytics/">เปิดใน Chrome</a>',
+    )
+
+    rep.add_measured(bullet(f"Settlement <code>{futures_ref:.1f}</code> | ATM IV {iv_cell} | 1-SD {em_text}"))
+    rep.add_measured(bullet(
+        f"ต้าน 2 <code>{res_2:.0f}</code> (OI {res_2_oi:,}) | ต้าน 1 <code>{res_1:.0f}</code> (OI {res_1_oi:,})"
+        f" | รับ 1 <code>{sup_1:.0f}</code> (OI {sup_1_oi:,}) | รับ 2 <code>{sup_2:.0f}</code> (OI {sup_2_oi:,})"
+    ))
+    rep.add_measured(bullet(
+        f"Put Wall <code>{put_wall:.0f}</code> | Call Wall <code>{call_wall:.0f}</code>"
+        f" | Max Pain <code>{max_pain:.0f}</code>"
+    ))
+    flow_measured = (
+        f"ต่างชาติ <code>{foreign_net:+,}</code> | กองทุน <code>{inst_net:+,}</code>"
+        f" | รายย่อย <code>{local_net:+,}</code>"
+    )
+    if total_oi:
+        flow_measured += f" | OI รวม <code>{total_oi:,}</code> (Δ {oi_note})"
+    rep.add_measured(bullet(flow_measured))
     for extra in (rv_line, profile_line, late_line):
         if extra:
-            measured.append(extra)
+            rep.add_measured(extra)
 
     # ---------------------------------------------------------------- inferred block
     gamma_cell = {
@@ -1657,69 +1672,44 @@ def generate_thai_trading_playbook(
         "unknown": "❔ ไม่ทราบโซน Gamma (ไม่พบจุด Flip ในกรอบที่ประเมิน) — งดใช้ gamma เป็นเหตุผล",
     }[gamma_mode]
 
-    inferred = [
-        f"  • <b>Flow:</b> {flow_emoji} {flow_regime} — <i>{flow_kind_text(flow_kind)}</i>",
-        f"  • <b>Dealer Gamma:</b> {gamma_cell} <i>(สมมติ: ดีลเลอร์ short OI ลูกค้า)</i>",
-    ]
-    inferred.extend(greeks_lines)
-    inferred.extend(footprint_lines)
+    rep.add_inferred(bullet(f"<b>Flow:</b> {flow_emoji} {flow_regime} — <i>{flow_kind_text(flow_kind)}</i>"))
+    rep.add_inferred(bullet(
+        f"<b>Dealer Gamma:</b> {gamma_cell} <i>(สมมติ: ดีลเลอร์ short OI ลูกค้า)</i>"
+    ))
+    for line in greeks_lines + footprint_lines:
+        rep.add_inferred(line)
 
-    # ---------------------------------------------------------------- assemble
-    header_meta = f"ข้อมูลพร้อม {ready} ส่วน"
-    if pending:
-        header_meta += f" · ยังไม่พร้อม {len(pending)}"
-    head = (
-        f"📊 <b>SET50 · {front_series} · ข้อมูลสิ้นวัน {trade_date}</b>\n"
-        f"🕖 <i>ออกรายงาน {as_of_time_bkk} น. | {header_meta}</i>"
-    )
-    plan_block = (
-        f"🎯 <b>แผน (ทำเฉพาะเมื่อเงื่อนไขเกิด)</b>\n"
-        f"  🟢 <b>Long</b> | {long_style} <code>{long_entry_lo:.1f}</code>–<code>{long_entry_hi:.0f}</code>"
-        f" | Stop Loss <code>&lt;{sl_long:.0f}</code>"
-        f" | {long_target_text}\n"
-        f"  🔴 <b>Short</b> | {short_style} <code>{short_entry_lo:.0f}</code>–<code>{short_entry_hi:.1f}</code>"
-        f" | Stop Loss <code>&gt;{sl_short:.1f}</code>"
-        f" | {short_target_text}\n"
-        f"  💡 <b>โหมด:</b> {central}\n"
-        f"  ⛔ <b>ไม่เทรดเมื่อ:</b> {no_trade}"
-    )
+    # ---------------------------------------------------------------- plan
+    rep.plan_heading = "🎯 <b>แผน (ทำเฉพาะเมื่อเงื่อนไขเกิด)</b>"
+    rep.add_plan(bullet(
+        f"🟢 <b>Long</b> | {long_style} <code>{long_entry_lo:.1f}</code>–<code>{long_entry_hi:.0f}</code>"
+        f" | Stop Loss <code>&lt;{sl_long:.0f}</code> | {long_target_text}"
+    ))
+    rep.add_plan(bullet(
+        f"🔴 <b>Short</b> | {short_style} <code>{short_entry_lo:.0f}</code>–<code>{short_entry_hi:.1f}</code>"
+        f" | Stop Loss <code>&gt;{sl_short:.1f}</code> | {short_target_text}"
+    ))
+    rep.add_plan(bullet(f"💡 <b>โหมด:</b> {central}"))
+    rep.add_plan(bullet(f"⛔ <b>ไม่เทรดเมื่อ:</b> {no_trade}"))
     if foreign_footprint and f_cost > 0:
         cum_f = foreign_footprint.get("cum_foreign_net", 0)
         side = "Short" if cum_f < 0 else "Long"
         pnl = (f_cost - futures_ref) if cum_f < 0 else (futures_ref - f_cost)
-        plan_block += (
-            f"\n  🏦 <b>ทุนต่างชาติ {foreign_footprint.get('history_days', 60)}D:</b> "
-            f"<code>{f_cost:.1f}</code> จุด ({side} กำไร {pnl:+.1f} จุด) — "
-            "ใช้เป็นแนวปะทะ ไม่ใช่เป้าหมาย"
-        )
+        rep.add_plan(bullet(
+            f"🏦 <b>ทุนต่างชาติ {foreign_footprint.get('history_days', 60)}D:</b> "
+            f"<code>{f_cost:.1f}</code> จุด ({side} กำไร {pnl:+.1f} จุด) — ใช้เป็นแนวปะทะ ไม่ใช่เป้าหมาย"
+        ))
 
-    watch = []
+    for item in pending:
+        rep.add_pending(item)
+
     if gamma_mode != "unknown":
-        watch.append(f"ปิด{'เหนือ' if gamma_mode == 'negative' else 'ใต้'} <code>{gamma_flip_val:.1f}</code> (gamma เปลี่ยนโซน)")
+        rep.add_watch(f"ปิด{'เหนือ' if gamma_mode == 'negative' else 'ใต้'} <code>{gamma_flip_val:.1f}</code> (gamma เปลี่ยนโซน)")
     if total_oi and oi_share is not None:
-        watch.append(f"OI เปลี่ยนเกิน {FLOW_NEUTRAL_OI_PCT * 100:.1f}% ของ OI (วันนี้ {oi_share:.3f}%)")
-    watch.append(f"หลุด <code>{sup_2:.0f}</code> หรือทะลุ <code>{res_2:.0f}</code> (กรอบเดิมพัง)")
+        rep.add_watch(f"OI เปลี่ยนเกิน {FLOW_NEUTRAL_OI_PCT * 100:.1f}% ของ OI (วันนี้ {oi_share:.3f}%)")
+    rep.add_watch(f"หลุด <code>{sup_2:.0f}</code> หรือทะลุ <code>{res_2:.0f}</code> (กรอบเดิมพัง)")
 
-    parts = [
-        head,
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        "📏 <b>วัดได้ (ข้อมูลจริงจาก TFEX)</b>",
-        "\n".join(measured),
-        "",
-        "🧠 <b>อนุมาน (มีสมมติฐาน — ไม่ใช่ข้อมูลดิบ)</b>",
-        "\n".join(inferred),
-        "",
-        plan_block,
-    ]
-    if pending:
-        parts.extend(["", "⏳ <b>ยังไม่พร้อม:</b> " + " · ".join(pending)])
-    parts.extend([
-        "",
-        "🔁 <b>เปลี่ยนมุมมองเมื่อ:</b> " + " · ".join(watch),
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        '🌐 <b>กราฟ:</b> <a href="https://met37818-stack.github.io/tfex-quant-analytics/">เปิดใน Chrome</a>',
-    ])
-    return "\n".join(parts)
+    return rep.build_telegram()
 
 
 def flow_kind_text(kind: str) -> str:
