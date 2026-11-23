@@ -157,5 +157,21 @@ class TestPlanIsFalsifiable(unittest.TestCase):
         self.assertLess(len(_playbook()), 4096)
 
 
+class TestCompactLayout(unittest.TestCase):
+    """Style A: one line per fact; the model-assumption detail stays in the dashboard."""
+
+    def test_message_stays_compact(self):
+        self.assertLessEqual(len(_playbook()), 2000, "the previous layout ran ~2,800 chars")
+
+    def test_greeks_and_footprint_live_in_the_dashboard_not_telegram(self):
+        msg = _playbook()
+        for token in ("25Δ Skew", "Vanna", "Charm", "Breakeven", "ΔOI", "ทุนต่างชาติ"):
+            self.assertNotIn(token, msg, f"{token} is dashboard detail, not a Telegram line")
+
+    def test_flow_caveat_is_never_doubled(self):
+        # the reduce-flow caveat belongs to the Flow line only; the plan used to repeat it
+        self.assertLessEqual(_playbook().count("ปิดสถานะเดิม"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
