@@ -2636,7 +2636,10 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         max_pain=max_pain,
         lookback_days=20
     )
-    print(f"[INTRADAY] Volume Profile ({volume_profile['warmup_days']}/20 days): POC={volume_profile['poc']:.0f}, VAH={volume_profile['vah']:.0f}, VAL={volume_profile['val']:.0f}")
+    if volume_profile.get("poc") is not None and volume_profile.get("vah") is not None and volume_profile.get("val") is not None:
+        print(f"[INTRADAY] Volume Profile ({volume_profile['warmup_days']}/20 days): POC={volume_profile['poc']:.0f}, VAH={volume_profile['vah']:.0f}, VAL={volume_profile['val']:.0f}")
+    else:
+        print(f"[INTRADAY] Volume Profile ({volume_profile.get('warmup_days', 0)}/20 days): [INSUFFICIENT DATA]")
     print(f"[INTRADAY] Confluence: {volume_profile['confluence_text']}")
 
     print("[INTRADAY] Analyzing Late-Session (16:30 - 16:55) Futures & Basis Flow...")
@@ -2647,8 +2650,20 @@ def run_premarket_radar(force: bool = False, no_telegram: bool = False, test_mod
         front_series=front_series,
         foreign_net=foreign_net
     )
-    print(f"[INTRADAY] Late Session: ΔFutures={late_session['late_fut_delta']:+.1f}, Basis Close={late_session['late_basis_close']:+.2f} (ΔBasis={late_session['late_basis_delta']:+.2f})")
-    print(f"[INTRADAY] Late Session Signal: {late_session['late_session_desc']}")
+    if (
+        late_session.get("has_data")
+        and late_session.get("late_fut_delta") is not None
+        and late_session.get("late_basis_close") is not None
+        and late_session.get("late_basis_delta") is not None
+    ):
+        print(
+            f"[INTRADAY] Late Session: ΔFutures={late_session['late_fut_delta']:+.1f}, "
+            f"Basis Close={late_session['late_basis_close']:+.2f} "
+            f"(ΔBasis={late_session['late_basis_delta']:+.2f})"
+        )
+    else:
+        print("[INTRADAY] Late Session: [INSUFFICIENT DATA]")
+    print(f"[INTRADAY] Late Session Signal: {late_session.get('late_session_desc', '—')}")
 
     # 8. Interactive HTML Dashboard Generation
     html_file = build_interactive_dashboard(

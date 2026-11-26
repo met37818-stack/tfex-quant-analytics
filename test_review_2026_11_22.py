@@ -127,5 +127,15 @@ class TestVolumeProfileBucket(unittest.TestCase):
         self.assertAlmostEqual(pmr.VOLUME_PROFILE_BUCKET, 0.1)
 
 
+class TestLateSessionNoneSafety(unittest.TestCase):
+    def test_analyze_late_session_flow_empty_returns_none_fields(self):
+        with patch.object(pmr, "execute_turso_sql", return_value=(["captured_at_bkk", "last"], [])):
+            res = pmr.analyze_late_session_flow("http://x", "tok", "2026-11-25", "S50Z26", 0)
+        self.assertFalse(res["has_data"])
+        self.assertIsNone(res["late_fut_delta"])
+        self.assertIsNone(res["late_basis_close"])
+        self.assertIsNone(res["late_basis_delta"])
+
+
 if __name__ == "__main__":
     unittest.main()
